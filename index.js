@@ -1,5 +1,4 @@
 // index.js
-
 require('dotenv').config();
 const { 
     Client, GatewayIntentBits, EmbedBuilder, PermissionFlagsBits, ChannelType, 
@@ -31,11 +30,11 @@ const CHEAP_GAS_TICKETS_CATEGORY_ID = '1409936283135901707';
 // --- LOYALTY CHANNEL CONFIGURATION ---
 const LOYALTY_TIER_REDIRECT_ID = '1422979794449989702'; 
 
-// --- STAFF PAYMENT DATA ---
+// --- STAFF PAYMENT DATA (CHIME UPDATED) ---
 const STAFF_PAYMENTS = {
     '1311570447564804116': { 
         name: 'distrodaddy',
-        chime: '$only1pradag-34',
+        chime: '$pradag-34', // <<< CHANGED
         zelle: 'navac0326@outlook.com',
         stripe: 'https://buy.stripe.com/7sY6oJboL4F50hxawx8og00'
     },
@@ -81,7 +80,7 @@ const commands = [{
     options: [{
         name: 'staff_member',
         description: 'The staff member you are paying.',
-        type: 6,
+        type: 6, // This is the 'USER' type
         required: true,
     }],
 },
@@ -232,11 +231,16 @@ client.on(Events.InteractionCreate, async interaction => {
                     ticketCreatorId = topicMatch[1];
                 }
             }
+
+            // --- FIX APPLIED HERE ---
+            // Find creator from first message ONLY if not found in topic AND if messages exist.
             if (!ticketCreatorId && messages.length > 0) {
                 const firstMsg = messages[0];
-                const mentionMatch = firstMsg.content.match(/<@!?(\d+)>/);
-                if (mentionMatch) {
-                    ticketCreatorId = mentionMatch[1];
+                if (firstMsg && firstMsg.content) {
+                    const mentionMatch = firstMsg.content.match(/<@!?(\d+)>/);
+                    if (mentionMatch) {
+                        ticketCreatorId = mentionMatch[1];
+                    }
                 }
             }
 
@@ -353,7 +357,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
         } catch (error) {
             console.error('Error closing ticket:', error);
-            interaction.editReply('❌ An error occurred while closing the ticket. Please try again.');
+            try {
+                await interaction.editReply('❌ An error occurred while closing the ticket. Please try again.');
+            } catch (editError) {
+                console.error('Failed to send error reply:', editError);
+            }
         }
     }
 
@@ -749,3 +757,4 @@ if (!process.env.DISCORD_TOKEN) {
         console.error('❌ Failed to login to Discord:', error);
     });
 }
+
