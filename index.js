@@ -6,21 +6,22 @@ const {
 } = require('discord.js');
 const express = require('express');
 const fs = require('fs').promises;
+const fs_sync = require('fs'); // For file streams
 const path = require('path');
+const axios = require('axios'); // For downloading images
 
 // --- CONFIGURATION ---
 const CLIENT_ID = process.env.CLIENT_ID || '1422439800627003562';                 
 const GUILD_ID = process.env.GUILD_ID || '1386924124433023058';              
 const TRANSCRIPT_LOG_CHANNEL_ID = process.env.TRANSCRIPT_LOG_CHANNEL_ID || '1386924127041880081'; 
 
-// --- VOUCH CHANNEL CONFIGURATION (NEW) ---
-// Vouch Channel IDs
-const FOOD_VOUCH_CHANNEL_ID = '1386924126844879012';            // For UB3R & D00RDASH
-const SUBSCRIPTION_VOUCH_CHANNEL_ID = '1386924126844879013';    // For SUBSCRIPTION, AIRPODS, & CHEAP GAS
-const MEAL_KIT_VOUCH_CHANNEL_ID = '1386924126844879014';        // For MEAL KITS
+// --- VOUCH CHANNEL CONFIGURATION ---
+const FOOD_VOUCH_CHANNEL_ID = '1386924126844879012';
+const SUBSCRIPTION_VOUCH_CHANNEL_ID = '1386924126844879013';
+const MEAL_KIT_VOUCH_CHANNEL_ID = '1386924126844879014';
 const DEFAULT_VOUCH_CHANNEL_ID = SUBSCRIPTION_VOUCH_CHANNEL_ID; 
 
-// --- TICKET CATEGORY IDs (NEW) ---
+// --- TICKET CATEGORY IDs ---
 const UB3R_TICKETS_CATEGORY_ID = '1386924125834051744';
 const DOORDASH_TICKETS_CATEGORY_ID = '1386940540351680513';
 const SUBSCRIPTION_TICKETS_CATEGORY_ID = '1386924125834051739';
@@ -30,33 +31,22 @@ const CHEAP_GAS_TICKETS_CATEGORY_ID = '1409936283135901707';
 // --- LOYALTY CHANNEL CONFIGURATION ---
 const LOYALTY_TIER_REDIRECT_ID = '1422979794449989702'; 
 
-// --- STAFF PAYMENT DATA (CHIME UPDATED) ---
+// --- STAFF PAYMENT DATA ---
 const STAFF_PAYMENTS = {
     '1311570447564804116': { 
         name: 'distrodaddy',
-        chime: '$pradag-34', // <<< CHANGED
+        chime: '$pradag-34',
         zelle: 'navac0326@outlook.com',
         stripe: 'https://buy.stripe.com/7sY6oJboL4F50hxawx8og00'
     },
-    '123456789012345678': {
-        name: 'Alice (Placeholder)',
-        paypal: 'alice@paypal.com',
-        cashapp: '$AliceCash',
-        venmo: '@Alice-Venmo'
-    },
-    '987654321098765432': {
-        name: 'Bob (Placeholder)',
-        btc: 'bc1q...bobaddress',
-        paypal: 'bob@paypal.com'
-    },
+    '123456789012345678': { name: 'Alice (Placeholder)', paypal: 'alice@paypal.com', cashapp: '$AliceCash', venmo: '@Alice-Venmo' },
+    '987654321098765432': { name: 'Bob (Placeholder)', btc: 'bc1q...bobaddress', paypal: 'bob@paypal.com' },
 };
 
 const client = new Client({
     intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers
+        GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers
     ]
 });
 
@@ -64,51 +54,61 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 const TRANSCRIPTS_DIR = './transcripts';
+const ATTACHMENTS_DIR = path.join(__dirname, 'public', 'attachments');
 
-// --- SLASH COMMANDS DATA (UPDATED FOR DM SUPPORT) ---
-const commands = [{
-    name: 'closeticket',
-    description: 'Closes the current ticket channel and saves the transcript.',
-    default_member_permissions: PermissionFlagsBits.ManageChannels.toString(),
-    // Command remains guild-only (default behavior)
-}, 
-{
-    name: 'pay',
-    description: 'Shows the available payment methods for a specified staff member.',
-    // ENAELES /pay command to be used in Direct Messages (DMs)
-    dm_permission: true, 
-    options: [{
-        name: 'staff_member',
-        description: 'The staff member you are paying.',
-        type: 6, // This is the 'USER' type
-        required: true,
-    }],
-},
-{
-    name: 'announce',
-    description: 'Announces the loyalty tier system and referral program.',
-    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-    // Command remains guild-only (default behavior)
-}];
+// Configure Express to serve static files (our downloaded attachments)
+app.use('/attachments', express.static(ATTACHMENTS_DIR));
 
-async function ensureTranscriptsDir() {
+// --- SLASH COMMANDS DATA ---
+const commands = [
+    { name: 'closeticket', description: 'Closes the current ticket channel and saves the transcript.', default_member_permissions: PermissionFlagsBits.ManageChannels.toString() }, 
+    { name: 'pay', description: 'Shows the available payment methods for a specified staff member.', dm_permission: true, options: [{ name: 'staff_member', description: 'The staff member you are paying.', type: 6, required: true }] },
+    { name: 'announce', description: 'Announces the loyalty tier system and referral program.', default_member_permissions: PermissionFlagsBits.Administrator.toString() }
+];
+
+async function ensureDir(dirPath) {
     try {
-        await fs.access(TRANSCRIPTS_DIR);
+        await fs.access(dirPath);
     } catch {
-        await fs.mkdir(TRANSCRIPTS_DIR, { recursive: true });
+        await fs.mkdir(dirPath, { recursive: true });
     }
 }
 
 async function saveTranscript(channelId, messages, ticketInfo) {
-    await ensureTranscriptsDir();
+    await ensureDir(TRANSCRIPTS_DIR);
+    await ensureDir(ATTACHMENTS_DIR);
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `ticket-${channelId}-${timestamp}.json`;
     const filepath = path.join(TRANSCRIPTS_DIR, filename);
+    
+    // Process messages to download attachments
+    for (const message of messages) {
+        if (message.attachments && message.attachments.length > 0) {
+            for (const attachment of message.attachments) {
+                if (attachment.contentType && attachment.contentType.startsWith('image/')) {
+                    try {
+                        const response = await axios({ method: 'get', url: attachment.url, responseType: 'stream' });
+                        const attachmentFilename = `${message.id}-${attachment.name}`;
+                        const attachmentPath = path.join(ATTACHMENTS_DIR, attachmentFilename);
+                        const writer = fs_sync.createWriteStream(attachmentPath);
+                        response.data.pipe(writer);
+                        await new Promise((resolve, reject) => {
+                            writer.on('finish', resolve);
+                            writer.on('error', reject);
+                        });
+                        // Replace expiring Discord URL with our permanent local URL
+                        attachment.url = `/attachments/${attachmentFilename}`;
+                    } catch (error) {
+                        console.error(`Failed to download attachment ${attachment.url}:`, error);
+                    }
+                }
+            }
+        }
+    }
 
-    const domain = process.env.REPLIT_DEV_DOMAIN 
-        ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
-        : `http://localhost:${PORT}`;
+    // <<< THIS IS THE UPDATED LINE >>>
+    const domain = `http://192.168.1.49:${PORT}`;
 
     const transcriptData = {
         ticketId: channelId,
@@ -120,70 +120,46 @@ async function saveTranscript(channelId, messages, ticketInfo) {
 
     await fs.writeFile(filepath, JSON.stringify(transcriptData, null, 2));
 
-    return {
-        filename: filename,
-        url: transcriptData.transcriptUrl
-    };
+    return { filename: filename, url: transcriptData.transcriptUrl };
 }
+
 
 async function fetchChannelMessages(channel) {
     const messages = [];
     let lastId;
-
     while (true) {
         const options = { limit: 100 };
         if (lastId) options.before = lastId;
-
         const batch = await channel.messages.fetch(options);
         if (batch.size === 0) break;
-
         batch.forEach(msg => {
-            const avatarURL = msg.author.displayAvatarURL({ extension: 'png', size: 64 });
-
             messages.push({
                 id: msg.id,
-                author: {
-                    id: msg.author.id,
-                    username: msg.author.username,
-                    tag: msg.author.tag,
-                    bot: msg.author.bot,
-                    avatarURL: avatarURL 
-                },
+                author: { id: msg.author.id, username: msg.author.username, tag: msg.author.tag, bot: msg.author.bot, avatarURL: msg.author.displayAvatarURL({ extension: 'png', size: 64 }) },
                 content: msg.content,
                 timestamp: msg.createdAt.toISOString(),
-                attachments: msg.attachments.map(att => ({
-                    name: att.name,
-                    url: att.url,
-                    contentType: att.contentType
-                })),
+                attachments: msg.attachments.map(att => ({ name: att.name, url: att.url, contentType: att.contentType })),
                 embeds: msg.embeds.map(embed => embed.toJSON())
             });
         });
-
         lastId = batch.last().id;
         if (batch.size < 100) break;
     }
-
     return messages.reverse();
 }
 
 client.on(Events.ClientReady, async c => {
     console.log(`✅ Bot is online as ${c.user.tag}`);
-    console.log(`📝 Transcript viewer available at: ${process.env.REPLIT_DEV_DOMAIN || `http://localhost:${PORT}`}`);
+    console.log(`📝 Transcript viewer available on your local network.`);
 
     if (process.env.DISCORD_TOKEN && CLIENT_ID) {
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
         try {
             console.log('Started refreshing GLOBAL application (/) commands.');
-
-            await rest.put(
-                Routes.applicationCommands(CLIENT_ID),
-                { body: commands }, 
-            );
-            console.log('✅ Successfully registered /closeticket, /pay, and /announce commands GLOBALLY.');
-            console.log('Note: Global commands may take up to an hour to appear in all servers.');
+            await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+            console.log('✅ Successfully registered commands GLOBALLY.');
         } catch (error) {
-            console.error('Error registering commands. Check CLIENT_ID or permissions:', error);
+            console.error('Error registering commands:', error);
         }
     } else {
         console.error('❌ CLIENT_ID or DISCORD_TOKEN is missing. Slash commands will not be registered.');
@@ -191,56 +167,34 @@ client.on(Events.ClientReady, async c => {
 });
 
 client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand()) {
-        return;
-    }
+    if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'closeticket') {
         await interaction.deferReply({ ephemeral: true });
 
-        // Ensure the command is used in a guild text channel (prevents DM usage)
         if (interaction.channel.type !== ChannelType.GuildText) {
-            const errorEmbed = new EmbedBuilder()
-                .setColor('#FF0000')
-                .setDescription('❌ This command must be used in a text channel.');
-
+            const errorEmbed = new EmbedBuilder().setColor('#FF0000').setDescription('❌ This command must be used in a text channel.');
             return interaction.editReply({ embeds: [errorEmbed] });
         }
-
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
             return interaction.editReply('❌ You do not have permission to close tickets!');
         }
-
         try {
             const channel = interaction.channel;
-
-            const closingEmbed = new EmbedBuilder()
-                .setColor('#FFA500')
-                .setTitle('📝 Saving Transcript...')
-                .setDescription('Please wait while we save the ticket transcript...')
-                .setTimestamp();
-
+            const closingEmbed = new EmbedBuilder().setColor('#FFA500').setTitle('📝 Saving Transcript...').setDescription('Please wait...').setTimestamp();
             await interaction.editReply({ embeds: [closingEmbed] });
 
             const messages = await fetchChannelMessages(channel);
-
             let ticketCreatorId = null;
             if (channel.topic) {
                 const topicMatch = channel.topic.match(/User ID: (\d+)/);
-                if (topicMatch) {
-                    ticketCreatorId = topicMatch[1];
-                }
+                if (topicMatch) ticketCreatorId = topicMatch[1];
             }
-
-            // --- FIX APPLIED HERE ---
-            // Find creator from first message ONLY if not found in topic AND if messages exist.
             if (!ticketCreatorId && messages.length > 0) {
                 const firstMsg = messages[0];
                 if (firstMsg && firstMsg.content) {
                     const mentionMatch = firstMsg.content.match(/<@!?(\d+)>/);
-                    if (mentionMatch) {
-                        ticketCreatorId = mentionMatch[1];
-                    }
+                    if (mentionMatch) ticketCreatorId = mentionMatch[1];
                 }
             }
 
@@ -248,141 +202,54 @@ client.on(Events.InteractionCreate, async interaction => {
             if (ticketCreatorId) {
                 try {
                     const creator = await client.users.fetch(ticketCreatorId);
-                    customerInfo = {
-                        id: creator.id,
-                        username: creator.username,
-                        tag: creator.tag
-                    };
-                } catch (error) {
-                    console.error('Could not fetch customer info:', error);
-                }
+                    customerInfo = { id: creator.id, username: creator.username, tag: creator.tag };
+                } catch (error) { console.error('Could not fetch customer info:', error); }
             }
-
             const ticketInfo = {
-                channelName: channel.name,
-                channelId: channel.id,
-                closedBy: {
-                    id: interaction.user.id,
-                    username: interaction.user.username,
-                    tag: interaction.user.tag
-                },
-                customer: customerInfo,
-                creatorId: ticketCreatorId,
-                messageCount: messages.length,
-                createdAt: channel.createdAt.toISOString()
+                channelName: channel.name, channelId: channel.id,
+                closedBy: { id: interaction.user.id, username: interaction.user.username, tag: interaction.user.tag },
+                customer: customerInfo, creatorId: ticketCreatorId, messageCount: messages.length, createdAt: channel.createdAt.toISOString()
             };
-
             const transcript = await saveTranscript(channel.id, messages, ticketInfo);
-
-            const successEmbed = new EmbedBuilder()
-                .setColor('#00FF00')
-                .setTitle('✅ Ticket Closed Successfully')
-                .setDescription(`This ticket has been closed and archived.`)
-                .addFields(
-                    { name: '📊 Messages Saved', value: `${messages.length} messages`, inline: true },
-                    { name: '👤 Closed By', value: interaction.user.tag, inline: true }
-                )
-                .setTimestamp()
-                .setFooter({ text: `Ticket ID: ${channel.id}` });
-
-            const button = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setLabel('View Transcript')
-                        .setURL(transcript.url)
-                        .setStyle(ButtonStyle.Link)
-                );
-
+            const successEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ Ticket Closed').setDescription(`This ticket has been archived.`)
+                .addFields({ name: '📊 Messages Saved', value: `${messages.length}`, inline: true }, { name: '👤 Closed By', value: interaction.user.tag, inline: true })
+                .setTimestamp().setFooter({ text: `Ticket ID: ${channel.id}` });
+            const button = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('View Transcript').setURL(transcript.url).setStyle(ButtonStyle.Link));
+            
             await channel.send({ embeds: [successEmbed], components: [button] });
-
-            await interaction.editReply({ content: `Transcript saved and final message sent. Deleting channel in 5 seconds.`, embeds: [] });
-
+            await interaction.editReply({ content: `Transcript saved. Deleting channel in 5 seconds.`, embeds: [] });
+            
             const logChannel = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
-            if (logChannel) {
-                await logChannel.send({ embeds: [successEmbed], components: [button] });
-            }
+            if (logChannel) await logChannel.send({ embeds: [successEmbed], components: [button] });
 
-            // --- START: NEW CONDITIONAL VOUCH LOGIC ---
             if (ticketInfo.creatorId) {
                 try {
                     const creator = await client.users.fetch(ticketInfo.creatorId);
-
-                    const parentId = channel.parentId; 
-                    let vouchChannelId = DEFAULT_VOUCH_CHANNEL_ID; 
-
-                    // 1. MEAL KITS go to MEAL KITS Vouch
-                    if (parentId === MEAL_KITS_TICKETS_CATEGORY_ID) {
-                        vouchChannelId = MEAL_KIT_VOUCH_CHANNEL_ID;
-                    } 
-                    // 2. UB3R and DOORDASH go to FOOD Vouch
-                    else if (parentId === UB3R_TICKETS_CATEGORY_ID || 
-                             parentId === DOORDASH_TICKETS_CATEGORY_ID) {
-                        vouchChannelId = FOOD_VOUCH_CHANNEL_ID;
-                    }
-                    // 3. SUBSCRIPTION & CHEAP GAS go to SUBSCRIPTION Vouch
-                    else if (parentId === SUBSCRIPTION_TICKETS_CATEGORY_ID || 
-                             parentId === CHEAP_GAS_TICKETS_CATEGORY_ID) {
-                        vouchChannelId = SUBSCRIPTION_VOUCH_CHANNEL_ID;
-                    }
-
-                    // Construct the final vouch message with a channel mention
-                    const vouchMessage = `\n\n**Action Required:** If you haven't yet, please leave a vouch for your experience in the correct channel: <#${vouchChannelId}>`;
-
-                    const dmEmbed = new EmbedBuilder()
-                        .setColor('#00FF00')
-                        .setTitle('📋 Your Ticket Has Been Closed')
-                        // Append the vouch message to the description
-                        .setDescription(`Your ticket **${ticketInfo.channelName}** has been closed and archived.${vouchMessage}`)
-                        .addFields(
-                            { name: '📊 Messages Saved', value: `${messages.length} messages`, inline: true },
-                            { name: '👤 Closed By', value: interaction.user.tag, inline: true }
-                        )
-                        .setTimestamp()
-                        .setFooter({ text: `Ticket ID: ${channel.id}` });
-
+                    const parentId = channel.parentId; let vouchChannelId = DEFAULT_VOUCH_CHANNEL_ID;
+                    if (parentId === MEAL_KITS_TICKETS_CATEGORY_ID) vouchChannelId = MEAL_KIT_VOUCH_CHANNEL_ID;
+                    else if (parentId === UB3R_TICKETS_CATEGORY_ID || parentId === DOORDASH_TICKETS_CATEGORY_ID) vouchChannelId = FOOD_VOUCH_CHANNEL_ID;
+                    else if (parentId === SUBSCRIPTION_TICKETS_CATEGORY_ID || parentId === CHEAP_GAS_TICKETS_CATEGORY_ID) vouchChannelId = SUBSCRIPTION_VOUCH_CHANNEL_ID;
+                    
+                    const vouchMessage = `\n\n**Action Required:** Please leave a vouch for your experience in <#${vouchChannelId}>.`;
+                    const dmEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('📋 Your Ticket Has Been Closed').setDescription(`Your ticket **${ticketInfo.channelName}** has been closed.${vouchMessage}`)
+                        .addFields({ name: '📊 Messages Saved', value: `${messages.length}`, inline: true }, { name: '👤 Closed By', value: interaction.user.tag, inline: true })
+                        .setTimestamp().setFooter({ text: `Ticket ID: ${channel.id}` });
                     await creator.send({ embeds: [dmEmbed], components: [button] });
-                } catch (error) {
-                    console.error('Could not DM ticket creator:', error);
-                }
+                } catch (error) { console.error('Could not DM ticket creator:', error); }
             }
-            // --- END: NEW CONDITIONAL VOUCH LOGIC ---
-
-            setTimeout(async () => {
-                try {
-                    await channel.delete('Ticket closed via /closeticket command');
-                } catch (error) {
-                    console.error(`Error deleting channel ${channel.id}:`, error);
-                }
-            }, 5000); 
-
+            setTimeout(async () => { try { await channel.delete('Ticket closed'); } catch (error) { console.error(`Error deleting channel ${channel.id}:`, error); } }, 5000); 
         } catch (error) {
             console.error('Error closing ticket:', error);
-            try {
-                await interaction.editReply('❌ An error occurred while closing the ticket. Please try again.');
-            } catch (editError) {
-                console.error('Failed to send error reply:', editError);
-            }
+            try { await interaction.editReply('❌ An error occurred.'); } catch (editError) { console.error('Failed to send error reply:', editError); }
         }
-    }
-
-    else if (interaction.commandName === 'pay') {
-        // This command works in DMs now because dm_permission is set to true
+    } else if (interaction.commandName === 'pay') {
         await interaction.deferReply({ ephemeral: false }); 
-
         const user = interaction.options.getUser('staff_member');
-        const staffId = user.id;
-
-        const paymentInfo = STAFF_PAYMENTS[staffId];
-
+        const paymentInfo = STAFF_PAYMENTS[user.id];
         if (!paymentInfo) {
-            const errorEmbed = new EmbedBuilder()
-                .setColor('#FF0000')
-                .setDescription(`❌ **${user.tag}** is not currently registered in the payment list or is not a staff member.`)
-                .setFooter({ text: 'Ensure the staff member is registered in the STAFF_PAYMENTS map.'});
-
+            const errorEmbed = new EmbedBuilder().setColor('#FF0000').setDescription(`❌ **${user.tag}** is not a registered staff member.`);
             return interaction.editReply({ embeds: [errorEmbed] });
         }
-
         let paymentDetails = [];
         if (paymentInfo.paypal) paymentDetails.push(`PayPal: \`${paymentInfo.paypal}\``);
         if (paymentInfo.cashapp) paymentDetails.push(`CashApp: \`${paymentInfo.cashapp}\``);
@@ -391,358 +258,81 @@ client.on(Events.InteractionCreate, async interaction => {
         if (paymentInfo.chime) paymentDetails.push(`Chime: \`${paymentInfo.chime}\``);
         if (paymentInfo.zelle) paymentDetails.push(`Zelle (Email): \`${paymentInfo.zelle}\``);
         if (paymentInfo.stripe) paymentDetails.push(`Stripe Link: [Click to Pay](${paymentInfo.stripe})`);
-
-        if (paymentDetails.length === 0) {
-            paymentDetails.push("No payment methods are currently configured for this staff member.");
-        }
-
-        const embed = new EmbedBuilder()
-            .setColor('#00FF00')
-            .setTitle(`💸 Payment Methods for ${paymentInfo.name}`)
-            .setDescription(`Please use one of the following methods to send payment to **${user.tag}**:`)
-            .setThumbnail(user.displayAvatarURL())
-            .addFields(
-                { name: 'Available Methods', value: paymentDetails.join('\n'), inline: false },
-                { name: 'Important', value: 'Double-check the username/tag before finalizing payment!', inline: false }
-            )
-            .setTimestamp();
-
+        
+        const embed = new EmbedBuilder().setColor('#00FF00').setTitle(`💸 Payment Methods for ${paymentInfo.name}`).setDescription(`Please use one of the following methods to pay **${user.tag}**:`)
+            .setThumbnail(user.displayAvatarURL()).addFields({ name: 'Available Methods', value: paymentDetails.join('\n') }).setTimestamp();
         await interaction.editReply({ embeds: [embed] });
-    }
-
-    else if (interaction.commandName === 'announce') { 
-        // This command will automatically be restricted to guilds (servers)
-        // since dm_permission is not set to true.
-        if (interaction.channel.type !== ChannelType.GuildText) {
-             return interaction.reply({ 
-                content: '❌ This command can only be used in a server channel.', 
-                ephemeral: true 
-            });
-        }
-
+    } else if (interaction.commandName === 'announce') { 
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-            return interaction.reply({ 
-                content: '❌ You need the Administrator permission to use this command.', 
-                ephemeral: true 
-            });
+            return interaction.reply({ content: '❌ You need Administrator permission.', ephemeral: true });
         }
-
         await interaction.deferReply({ ephemeral: true });
-
-        const loyaltyEmbed = new EmbedBuilder()
-            .setColor('#FFD700')
-            .setTitle('👑 Check Out Our Loyalty Tiers & Referral Program!')
-            .setDescription(`
-                We're excited to offer amazing rewards for our loyal customers and dedicated promoters! 
-
-                Click the **<#${LOYALTY_TIER_REDIRECT_ID}>** channel link below to see the **discounts** and **perks** associated with each tier role.
-            `)
+        const loyaltyEmbed = new EmbedBuilder().setColor('#FFD700').setTitle('👑 Loyalty Tiers & Referral Program!')
+            .setDescription(`We offer amazing rewards for loyal customers!\n\nClick **<#${LOYALTY_TIER_REDIRECT_ID}>** to see the discounts and perks for each tier.`)
             .addFields(
-                { 
-                    name: '⭐ Tier Benefits', 
-                    value: `Visit **<#${LOYALTY_TIER_REDIRECT_ID}>** to see what **tier role** you have! The more you order, the better the discounts get.`, 
-                    inline: false 
-                },
-                { 
-                    name: '🤝 Referral Program Rewards', 
-                    value: 'It pays to bring friends who order!',
-                    inline: false 
-                },
-                { 
-                    name: '🎁 Free Order Bonus', 
-                    value: 'For **every two invites** who join AND order from us, you get a **FREE ORDER** at absolutely no cost.', 
-                    inline: true 
-                },
-                { 
-                    name: '💰 At-Cost Order', 
-                    value: 'For **every single invite** who joins AND orders from us, you get an order at **COST** (our price, no markup!).', 
-                    inline: true 
-                }
-            )
-            .setTimestamp()
-            .setFooter({ text: 'Thank you for being a part of our community!' });
-
+                { name: '⭐ Tier Benefits', value: `Visit <#${LOYALTY_TIER_REDIRECT_ID}> to see your tier role! The more you order, the better the discounts.` },
+                { name: '🤝 Referral Program', value: 'It pays to bring friends who order!' },
+                { name: '🎁 Free Order Bonus', value: 'For **every two invites** who order, you get a **FREE ORDER**.', inline: true },
+                { name: '💰 At-Cost Order', value: 'For **every single invite** who orders, you get an order at **COST**.', inline: true }
+            ).setTimestamp().setFooter({ text: 'Thank you for being part of our community!' });
         try {
             await interaction.channel.send({ embeds: [loyaltyEmbed] });
-
-            await interaction.editReply({ 
-                content: `✅ Loyalty announcement successfully sent to **#${interaction.channel.name}**! It redirects to the #loyalty-tiers channel.`
-            });
-
+            await interaction.editReply({ content: `✅ Announcement sent to **#${interaction.channel.name}**!` });
         } catch (error) {
-            console.error('Error sending loyalty announcement:', error);
-            await interaction.editReply('❌ An error occurred while sending the message. Check bot permissions in the current channel.');
+            console.error('Error sending announcement:', error);
+            await interaction.editReply('❌ An error occurred. Check bot permissions.');
         }
     }
 });
 
 client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
-
     if (message.content.toLowerCase() === '!help') {
-        const helpEmbed = new EmbedBuilder()
-            .setColor('#0099FF')
-            .setTitle('🎫 Ticket Bot Commands')
-            .setDescription('Here are the available commands:')
+        const helpEmbed = new EmbedBuilder().setColor('#0099FF').setTitle('🎫 Ticket Bot Commands')
             .addFields(
-                { name: '/closeticket (Server Only)', value: 'Close the current ticket and save transcript.', inline: false },
-                { name: '/pay @StaffMember (Server & DM)', value: 'Shows the available payment methods for a staff member.', inline: false },
-                { name: '/announce (Server Only)', value: 'Announces the loyalty tier system and referral program.', inline: false }
-            )
-            .setTimestamp();
-
+                { name: '/closeticket (Server Only)', value: 'Closes the current ticket.' },
+                { name: '/pay @StaffMember (Server & DM)', value: 'Shows payment methods for a staff member.' },
+                { name: '/announce (Server Only)', value: 'Announces the loyalty program.' }
+            ).setTimestamp();
         message.reply({ embeds: [helpEmbed] });
     }
 });
 
 function escapeHtml(text) {
     if (!text) return '';
-    return text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
 app.get('/transcript/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
-
-        // Use a strict regex check for filename validation to prevent directory traversal
         const filenameRegex = /^ticket-[0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3}Z\.json$/;
-
-        if (!filename.match(filenameRegex)) {
-            return res.status(400).send('Invalid transcript filename format.');
-        }
-
-        // Use the strictly validated filename
+        if (!filename.match(filenameRegex)) return res.status(400).send('Invalid transcript filename.');
+        
         const filepath = path.join(TRANSCRIPTS_DIR, filename); 
-
         const data = await fs.readFile(filepath, 'utf8');
         const transcript = JSON.parse(data);
-
-        let html = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ticket Transcript - ${escapeHtml(transcript.ticketInfo.channelName)}</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment-timezone/0.5.43/moment-timezone-with-data.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: #36393f;
-            color: #dcddde;
-            padding: 20px;
-        }
-        .container { max-width: 1200px; margin: 0 auto; background: #2f3136; border-radius: 8px; overflow: hidden; }
-        .header { 
-            background: #202225; 
-            padding: 20px; 
-            border-bottom: 1px solid #202225;
-        }
-        .header h1 { color: #fff; margin-bottom: 10px; }
-        .ticket-info { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
-            gap: 15px; 
-            margin-top: 15px;
-        }
-        .info-item { background: #36393f; padding: 10px; border-radius: 4px; }
-        .info-label { color: #8e9297; font-size: 12px; text-transform: uppercase; margin-bottom: 5px; }
-        .info-value { color: #fff; font-size: 14px; }
-        .messages { padding: 20px; }
-        .message { 
-            display: flex; 
-            padding: 10px; 
-            margin-bottom: 10px;
-            border-radius: 4px;
-            transition: background 0.2s;
-        }
-        .message:hover { background: #32353b; }
-        .avatar { 
-            width: 40px; 
-            height: 40px; 
-            border-radius: 50%; 
-            margin-right: 15px;
-            flex-shrink: 0;
-            object-fit: cover;
-        }
-        .message-content { flex: 1; }
-        .message-header { margin-bottom: 5px; }
-        .username { color: #fff; font-weight: 600; margin-right: 8px; }
-        .bot-tag { 
-            background: #5865f2; 
-            color: #fff; 
-            font-size: 10px; 
-            padding: 2px 4px; 
-            border-radius: 3px;
-            margin-right: 8px;
-        }
-        .timestamp { color: #72767d; font-size: 12px; cursor: help; }
-        .message-text { color: #dcddde; white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; }
-        .attachment { 
-            margin-top: 8px; 
-            padding: 8px; 
-            background: #36393f; 
-            border-radius: 4px;
-            display: inline-block;
-        }
-        .attachment a { color: #00b0f4; text-decoration: none; }
-        .attachment a:hover { text-decoration: underline; }
-        .attachment img {
-            max-width: 100%; 
-            max-height: 300px;
-            border-radius: 4px;
-            margin-top: 8px;
-            display: block;
-        }
-        .timezone-info {
-            background: #36393f;
-            padding: 10px;
-            margin: 20px;
-            border-radius: 4px;
-            text-align: center;
-            color: #8e9297;
-            font-size: 12px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🎫 ${escapeHtml(transcript.ticketInfo.channelName)}</h1>
-            <div class="ticket-info">
-                <div class="info-item">
-                    <div class="info-label">Ticket ID</div>
-                    <div class="info-value">${escapeHtml(transcript.ticketInfo.channelId)}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Customer</div>
-                    <div class="info-value">${escapeHtml(transcript.ticketInfo.customer ? transcript.ticketInfo.customer.tag : 'Unknown')}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Closed By</div>
-                    <div class="info-value">${escapeHtml(transcript.ticketInfo.closedBy.tag)}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Messages</div>
-                    <div class="info-value">${transcript.ticketInfo.messageCount}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Created At</div>
-                    <div class="info-value timestamp" data-time="${transcript.ticketInfo.createdAt}">${transcript.ticketInfo.createdAt}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Closed At</div>
-                    <div class="info-value timestamp" data-time="${transcript.closedAt}">${transcript.closedAt}</div>
-                </div>
-            </div>
-        </div>
-        <div class="timezone-info">
-            All timestamps are displayed in your local timezone: <strong id="user-timezone">Loading...</strong>
-        </div>
-        <div class="messages">
-`;
-
+        
+        let html = `<!DOCTYPE html><html><head><title>Ticket Transcript</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/moment-timezone/0.5.43/moment-timezone-with-data.min.js"></script><style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px}.container{max-width:1200px;margin:0 auto;background:#2f3136;border-radius:8px;overflow:hidden}.header{background:#202225;padding:20px}h1{color:#fff}.message{display:flex;padding:10px;margin-bottom:10px}.avatar{width:40px;height:40px;border-radius:50%;margin-right:15px}.username{color:#fff;font-weight:600}.timestamp{color:#72767d;font-size:12px}.attachment img{max-width:100%;max-height:300px;border-radius:4px;margin-top:8px}</style></head><body><div class="container"><div class="header"><h1>🎫 ${escapeHtml(transcript.ticketInfo.channelName)}</h1></div><div class="messages">`;
         for (const msg of transcript.messages) {
-            const botTag = msg.author.bot ? '<span class="bot-tag">BOT</span>' : '';
-
-            html += `
-            <div class="message">
-                <img class="avatar" src="${escapeHtml(msg.author.avatarURL)}" alt="${escapeHtml(msg.author.username)}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
-                <div class="message-content">
-                    <div class="message-header">
-                        <span class="username">${escapeHtml(msg.author.username)}</span>
-                        ${botTag}
-                        <span class="timestamp" data-time="${escapeHtml(msg.timestamp)}">${escapeHtml(msg.timestamp)}</span>
-                    </div>
-                    <div class="message-text">${escapeHtml(msg.content || '')}</div>
-`;
-
+            html += `<div class="message"><img class="avatar" src="${escapeHtml(msg.author.avatarURL)}" alt="avatar" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'"><div class="message-content"><div class="message-header"><span class="username">${escapeHtml(msg.author.username)}</span> <span class="timestamp" data-time="${escapeHtml(msg.timestamp)}"></span></div><div class="message-text">${escapeHtml(msg.content||'')}</div>`;
             for (const att of msg.attachments) {
-                html += `<div class="attachment">`;
-                html += `<a href="${escapeHtml(att.url)}" target="_blank">📎 ${escapeHtml(att.name)}</a>`;
-
                 if (att.contentType && att.contentType.startsWith('image/')) {
-                    html += `<img src="${escapeHtml(att.url)}" alt="${escapeHtml(att.name)}">`;
+                    html += `<div class="attachment"><a href="${escapeHtml(att.url)}" target="_blank"><img src="${escapeHtml(att.url)}" alt="${escapeHtml(att.name)}"></a></div>`;
                 }
-
-                html += `</div>`;
             }
-
-            html += `
-                </div>
-            </div>
-`;
+            html += `</div></div>`;
         }
-
-        html += `
-        </div>
-    </div>
-    <script>
-        const userTimezone = moment.tz.guess();
-        document.getElementById('user-timezone').textContent = userTimezone;
-
-        document.querySelectorAll('.timestamp').forEach(el => {
-            const isoTime = el.getAttribute('data-time');
-            if (isoTime) {
-                const localTime = moment(isoTime).tz(userTimezone).format('YYYY-MM-DD HH:mm:ss z');
-                el.textContent = localTime;
-                el.title = 'Original: ' + isoTime;
-            }
-        });
-    </script>
-</body>
-</html>
-`;
-
+        html += `</div></div><script>document.querySelectorAll('.timestamp').forEach(el=>{const isoTime=el.getAttribute('data-time');if(isoTime){el.textContent=moment(isoTime).tz(moment.tz.guess()).format('YYYY-MM-DD HH:mm:ss z');}});</script></body></html>`;
         res.send(html);
     } catch (error) {
         console.error('Error serving transcript:', error);
-        res.status(404).send('Transcript not found');
+        res.status(404).send('Transcript not found.');
     }
 });
 
 app.get('/', (req, res) => {
-    res.send(`
-        <html>
-            <head>
-                <title>Discord Ticket Bot</title>
-                <style>
-                    body {
-                        font-family: Arial, sans-serif;
-                        background: #36393f;
-                        color: #dcddde;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        height: 100vh;
-                        margin: 0;
-                    }
-                    .container {
-                        text-align: center;
-                        background: #2f3136;
-                        padding: 40px;
-                        border-radius: 8px;
-                    }
-                    h1 { color: #fff; }
-                    .status { color: #43b581; margin-top: 20px; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>🎫 Discord Ticket Bot</h1>
-                    <p>Bot is running and ready to handle tickets!</p>
-                    <div class="status">✅ Online</div>
-                </div>
-            </body>
-        </html>
-    `);
+    res.send(`<html><body style="font-family:sans-serif;background:#36393f;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;"><h1>🎫 Discord Ticket Bot is running!</h1></body></html>`);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -751,7 +341,6 @@ app.listen(PORT, '0.0.0.0', () => {
 
 if (!process.env.DISCORD_TOKEN) {
     console.error('❌ ERROR: DISCORD_TOKEN is not set in environment variables!');
-    console.error('Please add your Discord bot token to continue.');
 } else {
     client.login(process.env.DISCORD_TOKEN).catch(error => {
         console.error('❌ Failed to login to Discord:', error);
