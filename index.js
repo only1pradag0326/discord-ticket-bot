@@ -82,7 +82,6 @@ async function saveTranscript(channelId, messages, ticketInfo) {
     const filename = `ticket-${channelId}-${timestamp}.json`;
     const filepath = path.join(TRANSCRIPTS_DIR, filename);
     
-    // Process messages to download attachments
     for (const message of messages) {
         if (message.attachments && message.attachments.length > 0) {
             for (const attachment of message.attachments) {
@@ -97,7 +96,6 @@ async function saveTranscript(channelId, messages, ticketInfo) {
                             writer.on('finish', resolve);
                             writer.on('error', reject);
                         });
-                        // Replace expiring Discord URL with our permanent local URL
                         attachment.url = `/attachments/${attachmentFilename}`;
                     } catch (error) {
                         console.error(`Failed to download attachment ${attachment.url}:`, error);
@@ -107,7 +105,6 @@ async function saveTranscript(channelId, messages, ticketInfo) {
         }
     }
 
-    // <<< THIS IS THE UPDATED LINE >>>
     const domain = `http://192.168.1.49:${PORT}`;
 
     const transcriptData = {
@@ -181,8 +178,9 @@ client.on(Events.InteractionCreate, async interaction => {
         }
         try {
             const channel = interaction.channel;
-            const closingEmbed = new EmbedBuilder().setColor('#FFA500').setTitle('📝 Saving Transcript...').setDescription('Please wait...').setTimestamp();
-            await interaction.editReply({ embeds: [closingEmbed] });
+            
+            // Send a quick confirmation that the process has started
+            await interaction.editReply({ content: '✅ Command received. Saving transcript and closing ticket...', embeds: [] });
 
             const messages = await fetchChannelMessages(channel);
             let ticketCreatorId = null;
@@ -211,14 +209,15 @@ client.on(Events.InteractionCreate, async interaction => {
                 customer: customerInfo, creatorId: ticketCreatorId, messageCount: messages.length, createdAt: channel.createdAt.toISOString()
             };
             const transcript = await saveTranscript(channel.id, messages, ticketInfo);
-            const successEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ Ticket Closed').setDescription(`This ticket has been archived.`)
+            const successEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ Ticket Closed').setDescription(`This ticket has been archived. The channel will be deleted in 5 seconds.`)
                 .addFields({ name: '📊 Messages Saved', value: `${messages.length}`, inline: true }, { name: '👤 Closed By', value: interaction.user.tag, inline: true })
                 .setTimestamp().setFooter({ text: `Ticket ID: ${channel.id}` });
             const button = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('View Transcript').setURL(transcript.url).setStyle(ButtonStyle.Link));
             
             await channel.send({ embeds: [successEmbed], components: [button] });
-            await interaction.editReply({ content: `Transcript saved. Deleting channel in 5 seconds.`, embeds: [] });
             
+            // <<< The final interaction.editReply was REMOVED from here to prevent the timeout error.
+
             const logChannel = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
             if (logChannel) await logChannel.send({ embeds: [successEmbed], components: [button] });
 
@@ -240,7 +239,7 @@ client.on(Events.InteractionCreate, async interaction => {
             setTimeout(async () => { try { await channel.delete('Ticket closed'); } catch (error) { console.error(`Error deleting channel ${channel.id}:`, error); } }, 5000); 
         } catch (error) {
             console.error('Error closing ticket:', error);
-            try { await interaction.editReply('❌ An error occurred.'); } catch (editError) { console.error('Failed to send error reply:', editError); }
+            try { await interaction.followUp({ content: '❌ An error occurred while closing the ticket. Please check the logs.', ephemeral: true }); } catch (followUpError) { console.error('Failed to send error reply:', followUpError); }
         }
     } else if (interaction.commandName === 'pay') {
         await interaction.deferReply({ ephemeral: false }); 
