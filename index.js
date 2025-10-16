@@ -164,6 +164,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'closeticket') {
+        // <<< FIX: Defer the reply immediately to prevent timeout.
         await interaction.deferReply({ ephemeral: true });
 
         if (interaction.channel.type !== ChannelType.GuildText) {
@@ -206,15 +207,14 @@ client.on(Events.InteractionCreate, async interaction => {
             
             const transcript = await saveTranscript(channel.id, messages, ticketInfo);
             
-            // <<< FIX: The link is now directly in the description, and the button is removed.
             const successEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ Ticket Closed').setDescription(`This ticket has been archived. The channel will be deleted in 5 seconds.\n\n[**Click here to view the transcript**](${transcript.url})`)
                 .addFields({ name: '📊 Messages Saved', value: `${messages.length}`, inline: true }, { name: '👤 Closed By', value: interaction.user.tag, inline: true })
                 .setTimestamp().setFooter({ text: `Ticket ID: ${channel.id}` });
             
-            await channel.send({ embeds: [successEmbed] }); // <<< FIX: No more 'components'
+            await channel.send({ embeds: [successEmbed] });
             
             const logChannel = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
-            if (logChannel) await logChannel.send({ embeds: [successEmbed] }); // <<< FIX: No more 'components'
+            if (logChannel) await logChannel.send({ embeds: [successEmbed] });
 
             if (ticketInfo.creatorId) {
                 try {
@@ -226,11 +226,10 @@ client.on(Events.InteractionCreate, async interaction => {
                     
                     const vouchMessage = `\n\n**Action Required:** Please leave a vouch for your experience in <#${vouchChannelId}>.`;
                     
-                    // <<< FIX: The link is now directly in the description for DMs too.
                     const dmEmbed = new EmbedBuilder().setColor('#00FF00').setTitle('📋 Your Ticket Has Been Closed').setDescription(`Your ticket **${ticketInfo.channelName}** has been closed.\n\n[**Click here to view the transcript**](${transcript.url})${vouchMessage}`)
                         .addFields({ name: '📊 Messages Saved', value: `${messages.length}`, inline: true }, { name: '👤 Closed By', value: interaction.user.tag, inline: true })
                         .setTimestamp().setFooter({ text: `Ticket ID: ${channel.id}` });
-                    await creator.send({ embeds: [dmEmbed] }); // <<< FIX: No more 'components'
+                    await creator.send({ embeds: [dmEmbed] });
                 } catch (error) { console.error('Could not DM ticket creator:', error); }
             }
             setTimeout(async () => { try { await channel.delete('Ticket closed'); } catch (error) { console.error(`Error deleting channel ${channel.id}:`, error); } }, 5000); 
@@ -239,21 +238,66 @@ client.on(Events.InteractionCreate, async interaction => {
             try { await interaction.followUp({ content: '❌ An error occurred while closing the ticket. Please check the logs.', ephemeral: true }); } catch (followUpError) { console.error('Failed to send error reply:', followUpError); }
         }
     } else if (interaction.commandName === 'pay') {
-        // ... (this command is unchanged)
+        await interaction.deferReply({ ephemeral: false }); 
+        const user = interaction.options.getUser('staff_member');
+        const paymentInfo = STAFF_PAYMENTS[user.id];
+        if (!paymentInfo) {
+            const errorEmbed = new EmbedBuilder().setColor('#FF0000').setDescription(`❌ **${user.tag}** is not a registered staff member.`);
+            return interaction.editReply({ embeds: [errorEmbed] });
+        }
+        let paymentDetails = [];
+        if (paymentInfo.paypal) paymentDetails.push(`PayPal: \`${paymentInfo.paypal}\``);
+        if (paymentInfo.cashapp) paymentDetails.push(`CashApp: \`${paymentInfo.cashapp}\``);
+        if (paymentInfo.venmo) paymentDetails.push(`Venmo: \`${paymentInfo.venmo}\``);
+        if (paymentInfo.btc) paymentDetails.push(`Bitcoin (BTC): \`${paymentInfo.btc}\``);
+        if (paymentInfo.chime) paymentDetails.push(`Chime: \`${paymentInfo.chime}\``);
+        if (paymentInfo.zelle) paymentDetails.push(`Zelle (Email): \`${paymentInfo.zelle}\``);
+        if (paymentInfo.stripe) paymentDetails.push(`Stripe Link: [Click to Pay](${paymentInfo.stripe})`);
+        
+        const embed = new EmbedBuilder().setColor('#00FF00').setTitle(`💸 Payment Methods for ${paymentInfo.name}`).setDescription(`Please use one of the following methods to pay **${user.tag}**:`)
+            .setThumbnail(user.displayAvatarURL()).addFields({ name: 'Available Methods', value: paymentDetails.join('\n') }).setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
     } else if (interaction.commandName === 'announce') { 
-        // ... (this command is unchanged)
+        if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return interaction.reply({ content: '❌ You need Administrator permission.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        const loyaltyEmbed = new EmbedBuilder().setColor('#FFD700').setTitle('👑 Loyalty Tiers & Referral Program!')
+            .setDescription(`We offer amazing rewards for loyal customers!\n\nClick **<#${LOYALTY_TIER_REDIRECT_ID}>** to see the discounts and perks for each tier.`)
+            .addFields(
+                { name: '⭐ Tier Benefits', value: `Visit <#${LOYALTY_TIER_REDIRECT_ID}> to see your tier role! The more you order, the better the discounts.` },
+                { name: '🤝 Referral Program', value: 'It pays to bring friends who order!' },
+                { name: '🎁 Free Order Bonus', value: 'For **every two invites** who order, you get a **FREE ORDER**.', inline: true },
+                { name: '💰 At-Cost Order', value: 'For **every single invite** who orders, you get an order at **COST**.', inline: true }
+            ).setTimestamp().setFooter({ text: 'Thank you for being part of our community!' });
+        try {
+            await interaction.channel.send({ embeds: [loyaltyEmbed] });
+            await interaction.editReply({ content: `✅ Announcement sent to **#${interaction.channel.name}**!` });
+        } catch (error) {
+            console.error('Error sending announcement:', error);
+            await interaction.editReply('❌ An error occurred. Check bot permissions.');
+        }
     }
 });
 
 client.on(Events.MessageCreate, async message => {
-    // ... (this event is unchanged)
+    if (message.author.bot) return;
+    if (message.content.toLowerCase() === '!help') {
+        const helpEmbed = new EmbedBuilder().setColor('#0099FF').setTitle('🎫 Ticket Bot Commands')
+            .addFields(
+                { name: '/closeticket (Server Only)', value: 'Closes the current ticket.' },
+                { name: '/pay @StaffMember (Server & DM)', value: 'Shows payment methods for a staff member.' },
+                { name: '/announce (Server Only)', value: 'Announces the loyalty program.' }
+            ).setTimestamp();
+        message.reply({ embeds: [helpEmbed] });
+    }
 });
 
-// ... The rest of the file (web server) is unchanged ...
 function escapeHtml(text) {
     if (!text) return '';
     return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
+
 app.get('/transcript/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
@@ -281,12 +325,15 @@ app.get('/transcript/:filename', async (req, res) => {
         res.status(404).send('Transcript not found.');
     }
 });
+
 app.get('/', (req, res) => {
     res.send(`<html><body style="font-family:sans-serif;background:#36393f;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;"><h1>🎫 Discord Ticket Bot is running!</h1></body></html>`);
 });
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server running on port ${PORT}`);
 });
+
 if (!process.env.DISCORD_TOKEN) {
     console.error('❌ ERROR: DISCORD_TOKEN is not set in environment variables!');
 } else {
@@ -294,5 +341,4 @@ if (!process.env.DISCORD_TOKEN) {
         console.error('❌ Failed to login to Discord:', error);
     });
 }
-
 
