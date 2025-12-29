@@ -1,1086 +1,1610 @@
-// index.js — INVINCIBLE EATS bot (CommonJS, discord.js v14)
-// Tickets + transcripts + payments + auto-bump + anti-promo
-//
-// Required ENV: DISCORD_TOKEN, CLIENT_ID
-// Optional ENV: TRANSCRIPT_LOG_ID, UBER_TICKETS_CHANNEL
-require('dotenv').config();
+// ============================================
+// INVINCIBLE EATS — FINAL BOT FILE (STANDARD FORMAT)
+// ============================================
 
-// ============ Dependencies ============
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const axios = require('axios');
-const express = require('express');
+require("dotenv").config();
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const axios = require("axios");
+const express = require("express");
+
 const {
-  Client, GatewayIntentBits, Partials,
-  REST, Routes,
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
   SlashCommandBuilder,
-  EmbedBuilder,
   PermissionFlagsBits,
-  ActionRowBuilder,
+  EmbedBuilder,
   ButtonBuilder,
+  ActionRowBuilder,
   ButtonStyle,
-  AttachmentBuilder,
-} = require('discord.js');
+  AttachmentBuilder
+} = require("discord.js");
 
-// ============ Web server (keep-alive + serve assets) ============
+// ============================================
+// EXPRESS HOST (for transcripts + attachments)
+// ============================================
+
 const app = express();
-const PUBLIC_DIR = path.join(__dirname, 'public');
-const ATTACH_DIR = path.join(PUBLIC_DIR, 'attachments');
-const TRANSCRIPT_DIR = path.join(PUBLIC_DIR, 'transcripts');
-fs.mkdirSync(ATTACH_DIR, { recursive: true });
+const PORT = process.env.PORT || 3000;
+
+// ============================================
+// IMPORTANT IDs (FROM YOU)
+// ============================================
+
+// Status / Orders
+const STATUS_CHANNEL_ID = "1386956979632734238";
+const STATUS_ANNOUNCE_CHANNEL_ID = "1386924126844879008";
+const ORDER_PERMS_CHANNEL_ID = "1386924125834051737";
+
+// Customer base + tiers
+const HERO_IN_TRAINING_ROLE_ID = "1386924124860846131"; // everyone gets this
+const VERIFIED_BUYER_ROLE_ID = "1396954121780854874";
+const FREQUENT_BUYER_ROLE_ID = "1396955746108833842";
+const VILTRUMITE_ROLE_ID = "1394179600187261058"; // Diamond tier
+
+// Staff roles (complete list)
+const JUSTICE_CHEF_ROLE_ID = "1386924124873556029";          // existing
+const INVINCIBLE_CHEF_ROLE_ID = "1386924124873556038";       // existing
+const JUSTICE_CHEF_ON_PATROL_ROLE_ID = "1386924124873556030";
+const UE_CHEF_ROLE_ID = "1386924124860846137";
+const DD_CHEF_ROLE_ID = "1386924124860846135";
+
+// Transcript log + UE tickets
+const TRANSCRIPT_LOG_ID = "1386924127041880081";
+const UBER_TICKETS_CHANNEL = "1386924125834051744";
+
+// Bump + TicketTool
+const DISBOARD_BOT_ID = "302050872383242240";
+const TICKETTOOL_BOT_ID = "557628352828014614"; // Ticket Tool bot (global)
+
+// Staff role list (used for opener detection & anti-promo bypass)
+const STAFF_ROLE_IDS = [
+  JUSTICE_CHEF_ROLE_ID,
+  INVINCIBLE_CHEF_ROLE_ID,
+  JUSTICE_CHEF_ON_PATROL_ROLE_ID,
+  UE_CHEF_ROLE_ID,
+  DD_CHEF_ROLE_ID
+];
+
+// ============================================
+// STORAGE SYSTEM
+// ============================================
+
+const DATA_DIR = path.join(__dirname, "data");
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, data) {
+  fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
+}
+
+const payStore = readJson("pay.json", {});                // staffId -> { name, methods: { MethodName: value } }
+const bumpStore = readJson("bumps.json", {});             // guildId -> { channelId, intervalMin, lastBumpTs }
+const vouchByStaff = readJson("vouches_by_staff.json", {});  // staffId -> count
+const vouchByCust = readJson("vouches_by_customer.json", {}); // customerId -> count
+
+// ============================================
+// DIRECTORIES
+// ============================================
+
+const TRANSCRIPT_DIR = path.join(__dirname, "transcripts");
+const ATTACH_DIR = path.join(__dirname, "attachments");
+
 fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+fs.mkdirSync(ATTACH_DIR, { recursive: true });
 
-app.use('/attachments', express.static(ATTACH_DIR, { maxAge: '30d', immutable: true }));
-app.use('/transcripts', express.static(TRANSCRIPT_DIR, { maxAge: '30d', immutable: false }));
-app.get('/', (_, res) => res.send('INVINCIBLE EATS bot is running.'));
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log('🌐 Web server on', PORT));
+// ============================================
+// EXTERNAL BASE URL
+// ============================================
 
-// Helper to detect hosting domain for links
 function externalBase() {
-  const replit = process.env.REPLIT_DEV_DOMAIN;
-  if (replit) return `https://${replit}`;
-  const render = process.env.RENDER_EXTERNAL_URL;
-  if (render) return render.replace(/\/$/, '');
+  if (process.env.REPLIT_DEV_DOMAIN) return `https://${process.env.REPLIT_DEV_DOMAIN}`;
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "");
   return `http://localhost:${PORT}`;
 }
 
-// ============ Client ============
+// ============================================
+// DISCORD CLIENT
+// ============================================
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMembers
   ],
-  partials: [Partials.Channel, Partials.Message, Partials.GuildMember, Partials.User],
+  partials: [Partials.Message, Partials.Channel, Partials.User, Partials.GuildMember]
 });
 
-// ============ Persistence helpers ============
-const DATA_DIR = path.join(__dirname, 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf8')); } catch { return d; } };
-const writeJson = (f, o) => fs.writeFileSync(path.join(DATA_DIR, f), JSON.stringify(o, null, 2));
+// ============================================
+// UTILS
+// ============================================
 
-// ============ Stores ============
-const bumpStore    = readJson('bumps.json', {});
-const vouchByStaff = readJson('vouches_by_staff.json', {});
-const vouchByCust  = readJson('vouches_by_customer.json', {});
-const payStore     = readJson('pay.json', {});
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+const fmtMoney = n =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n ?? 0);
 
-// ============ Config ============
-// Order transcripts log channel (where transcripts are logged)
-const TRANSCRIPT_LOG_FALLBACK_ID = '1386924127041880081'; // Order transcripts log
-const TRANSCRIPT_LOG_ID =
-  process.env.TRANSCRIPT_LOG_ID ||
-  process.env.TRANSCRIPT_LOG_CHANNEL ||
-  TRANSCRIPT_LOG_FALLBACK_ID ||
-  '';
-
-const UBER_TICKETS_CHANNEL = process.env.UBER_TICKETS_CHANNEL || '1386924125834051744';
-
-// Vouch roles
-const ROLE_THRESH = [
-  { min: 10, roleId: '1394179600187261058', label: 'VILTRUMITE' },
-  { min: 5,  roleId: '1396955746108833842', label: 'Frequent Buyer' },
-  { min: 2,  roleId: '1396954121780854874', label: 'Verified Buyer' },
-  { min: 1,  roleId: '1386924124860846131', label: 'HERO IN TRAINING' },
-];
-const roleIdsSet = new Set(ROLE_THRESH.map(r => r.roleId));
-
-// === restaurant status guard config ===
-const STATUS_CHANNEL_ID = '1386956979632734238';           // status channel
-const JUSTICE_CHEF_ROLE_ID = '1386924124873556030';         // "Justice Chef on patrol"
-const STATUS_ANNOUNCE_CHANNEL_ID = '1386924126844879008';   // announcements go here
-
-// Disboard bot ID for auto bump
-const DISBOARD_BOT_ID = '302050872383242240';
-
-// ============ Utils ============
-const fmtMoney = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n || 0);
-const isUrl = (s = '') => /^https?:\/\//i.test(s);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function tierForCount(count) { for (const t of ROLE_THRESH) if (count >= t.min) return t; return null; }
-async function applyCustomerRoles(guild, member, count) {
-  const tier = tierForCount(count); if (!tier) return;
-  const remove = member.roles.cache.filter(r => roleIdsSet.has(r.id) && r.id !== tier.roleId);
-  if (remove.size) await member.roles.remove(remove).catch(() => { });
-  await member.roles.add(tier.roleId).catch(() => { });
+function slugifyUsername(name) {
+  return (name || "user")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
 }
 
-// ============ Anti-promo patterns ============
+function extractTicketNumberFromChannel(name = "") {
+  const m = name.match(/(\d{3,})$/);
+  return m ? m[1] : null;
+}
+
+function isTicketChannel(name = "") {
+  return /^ticket-\d+$/i.test(name) || /-invincible-\d+$/i.test(name);
+}
+
+// Simple anti-promo patterns
 const PROMO_PATTERNS = [
-  // Original patterns
   /amazon\s+review/i,
   /paypal\s+refund/i,
   /review\s+partners?/i,
-  /\b(buy\s+now|discount|coupon)\b/i,
-  /⭐\s*5[-\s]*star/i,
-
-  // Generic promo / selling / spam keywords
+  /\bcoupon\b/i,
   /\bpromo\b/i,
-  /\bpromotion\b/i,
-  /\bself\s*promo\b/i,
-  /\bcheap\s+\w+/i,
-  /\bselling\s+\w+/i,
-  /\bsell\s+accounts?\b/i,
-  /\bboost\s+service\b/i,
   /\bverification\s*service\b/i,
-  /\buse\s+code\s+\w+/i,
-  /\b5\s*star\s+reviews?\b/i,
-
-  // Common spammy links
   /discord\.gg\//i,
-  /discord\.com\/invite\//i,
   /t\.me\//i,
   /wa\.me\//i,
-  /paypal\.me\//i,
-  /cash\.app\//i,
+  /\b5\s*star\b/i,
+  /\bjoin\s+my\s+server\b/i,
+  /\bcash\.app\//i,
+  /\bcheaper\b/i,
+  /http(s)?:\/\//i
 ];
 
-// ============ Status guard helper ============
+const UE_REGEX = /https:\/\/www\.ubereats\.com\/group-order\/[^ \n]+/i;
+
+// Avatar helper
+function safeAvatarUrl(user) {
+  try {
+    return user.displayAvatarURL({ extension: "png", size: 64 });
+  } catch {
+    return "";
+  }
+}
+
+// HTML escape
+function escapeHTML(s = "") {
+  return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Attachment helpers
+function localAttachPath(name) {
+  return path.join(ATTACH_DIR, name);
+}
+function localAttachUrl(name) {
+  return `${externalBase()}/attachments/${encodeURIComponent(name)}`;
+}
+
+// File download
+async function downloadTo(filePath, url) {
+  const res = await axios({ method: "GET", url, responseType: "stream" });
+  await new Promise((resolve, reject) => {
+    const w = fs.createWriteStream(filePath);
+    res.data.pipe(w);
+    w.on("finish", resolve);
+    w.on("error", reject);
+  });
+}
+
+// ============================================
+// STATUS GUARD & WATCHDOG
+// ============================================
+
+// Prevent OPEN unless Justice Chef is online
 async function enforceStatusGuard(message) {
   try {
     if (!message.guild) return;
     if (message.channel.id !== STATUS_CHANNEL_ID) return;
 
-    // Get content / embed text and check if it's "open"
-    const rawContent = (message.content || '').toLowerCase();
-    const embedText = (message.embeds?.[0]?.description || message.embeds?.[0]?.title || '').toLowerCase();
-    const text = rawContent + ' ' + embedText;
+    const raw = (message.content || "").toLowerCase();
+    const embedText =
+      (message.embeds?.[0]?.description || message.embeds?.[0]?.title || "").toLowerCase();
 
-    if (!text.includes('open')) return; // nothing to do
+    const text = raw + " " + embedText;
 
-    // Fetch members and see if anyone has the Justice Chef role
+    const looksOpen =
+      text.includes("🟢") ||
+      text.includes("open") ||
+      text.includes("status: open");
+
+    if (!looksOpen) return;
+
     const members = await message.guild.members.fetch();
-    const hasChefs = members.some(m => m.roles.cache.has(JUSTICE_CHEF_ROLE_ID));
+    const hasChef = members.some(m => m.roles.cache.has(JUSTICE_CHEF_ROLE_ID));
+    if (hasChef) return;
 
-    if (hasChefs) return; // at least one chef on patrol, allow open
+    // No chef → revert to CLOSED
+    let newText = message.content || "";
+    newText = newText
+      .replace(/🟢/g, "🔴")
+      .replace(/open/gi, "CLOSED (no Justice Chef)");
 
-    // No chefs with the role -> revert status back to closed
-    let newContent = message.content || '';
-    if (!newContent) {
-      newContent = 'Status: CLOSED (no Justice Chef on patrol)';
-    } else {
-      newContent = newContent.replace(/open/gi, 'CLOSED (no Justice Chef on patrol)');
+    await message.edit(newText).catch(() => {});
+
+    // Fix perms in order channel
+    const orderCh = message.guild.channels.cache.get(ORDER_PERMS_CHANNEL_ID);
+    if (orderCh) {
+      await orderCh.permissionOverwrites.edit(HERO_IN_TRAINING_ROLE_ID, {
+        ViewChannel: true,
+        ReadMessageHistory: true
+      }).catch(() => {});
     }
 
-    await message.edit(newContent).catch(() => { });
-
-    // Post announcement in configured channel
-    try {
-      const annCh = await client.channels.fetch(STATUS_ANNOUNCE_CHANNEL_ID);
-      if (annCh) {
-        const e = new EmbedBuilder()
-          .setColor(0xef4444)
-          .setTitle('Restaurant status reverted to CLOSED')
-          .setDescription([
-            'The restaurant status was set to **open**, but no one currently has the **Justice Chef on patrol** role.',
-            '',
-            'Status has been automatically set back to **closed** until a Justice Chef is on patrol.',
-          ].join('\n'))
-          .setTimestamp();
-        await annCh.send({ embeds: [e] });
-      }
-    } catch (e) {
-      console.log('Status announcement failed:', e.message);
+    // Status announcement
+    const ann = client.channels.cache.get(STATUS_ANNOUNCE_CHANNEL_ID);
+    if (ann) {
+      const e = new EmbedBuilder()
+        .setColor(0xef4444)
+        .setTitle("⚠️ Status Reverted — No Justice Chef")
+        .setDescription(
+          "Someone set the restaurant to **OPEN**, but no one with the **Justice Chef on patrol** role is online.\n\n" +
+          "Status reverted to **🔴 CLOSED**, and order permissions restored."
+        )
+        .setTimestamp();
+      ann.send({ embeds: [e] });
     }
-  } catch (e) {
-    console.log('Status guard error:', e.message);
+
+  } catch (err) {
+    console.log("Status Guard Error:", err);
   }
 }
 
-// ============ Message handlers ============
+// Permission watchdog (runs every 5 seconds)
+function startStatusWatchdog(client) {
+  setInterval(async () => {
+    try {
+      const guild = client.guilds.cache.first();
+      if (!guild) return;
 
-// messageCreate: anti-promo + status guard + auto bump
-client.on('messageCreate', async (msg) => {
+      const orderCh = guild.channels.cache.get(ORDER_PERMS_CHANNEL_ID);
+      if (!orderCh) return;
+
+      const heroPerms = orderCh.permissionOverwrites.cache.get(HERO_IN_TRAINING_ROLE_ID);
+
+      const mismatch =
+        !heroPerms ||
+        heroPerms.allow.has("ViewChannel") !== true ||
+        heroPerms.allow.has("ReadMessageHistory") !== true;
+
+      if (!mismatch) return;
+
+      // Only allow changes if Justice Chef is present
+      const members = await guild.members.fetch();
+      const chefPresent = members.some(m => m.roles.cache.has(JUSTICE_CHEF_ROLE_ID));
+      if (chefPresent) return;
+
+      // Auto-repair perms
+      await orderCh.permissionOverwrites.edit(HERO_IN_TRAINING_ROLE_ID, {
+        ViewChannel: true,
+        ReadMessageHistory: true
+      }).catch(() => {});
+
+      // Fix status message as well
+      const statusCh = guild.channels.cache.get(STATUS_CHANNEL_ID);
+      if (statusCh) {
+        const msgs = await statusCh.messages.fetch({ limit: 1 }).catch(() => null);
+        const msg = msgs?.first();
+        if (msg) {
+          const edited = (msg.content || "🔴 CLOSED")
+            .replace(/🟢/g, "🔴")
+            .replace(/open/gi, "CLOSED (no Justice Chef)");
+          await msg.edit(edited).catch(() => {});
+        }
+      }
+
+      // Announce the correction
+      const ann = guild.channels.cache.get(STATUS_ANNOUNCE_CHANNEL_ID);
+      if (ann) {
+        const e = new EmbedBuilder()
+          .setColor(0xff4444)
+          .setTitle("⚠️ Unauthorized Change Reverted")
+          .setDescription(
+            "Order-channel permissions were changed without a **Justice Chef** online.\n\n" +
+            "Permissions restored and status forced to **CLOSED**."
+          )
+          .setTimestamp();
+        ann.send({ embeds: [e] });
+      }
+
+    } catch (err) {
+      console.log("Watchdog error:", err);
+    }
+  }, 5000);
+}
+
+// ============================================
+// BUMP TIMER SYSTEM
+// ============================================
+
+function scheduleBumpTimer(guildId) {
+  const cfg = bumpStore[guildId];
+  if (!cfg) return;
+
+  const intervalMs = (cfg.intervalMin || 120) * 60 * 1000;
+
+  if (cfg._timer) clearTimeout(cfg._timer);
+
+  cfg._timer = setTimeout(async () => {
+    try {
+      const g = client.guilds.cache.get(guildId);
+      if (!g) return;
+
+      const ch = g.channels.cache.get(cfg.channelId);
+      if (!ch) return;
+
+      await ch.send("🔔 **Time to bump!** Use `/bump` or type `!d bump`.");
+    } catch (err) {
+      console.log("Bump timer error:", err);
+    }
+  }, intervalMs);
+}
+
+// ============================================
+// MESSAGE HANDLERS
+// ============================================
+
+client.on("messageCreate", async msg => {
   if (!msg.guild) return;
 
-  // ===== Auto-detect Disboard bump and reset timer =====
+  // 1) Auto-detect Disboard bump
   try {
     if (msg.author.id === DISBOARD_BOT_ID && msg.embeds?.length) {
       const emb = msg.embeds[0];
-      const text = `${emb.title || ''} ${emb.description || ''}`.toLowerCase();
-      if (text.includes('bump done')) {
+      const text = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
+
+      if (text.includes("bump done")) {
         const gId = msg.guild.id;
+
         if (bumpStore[gId]) {
           bumpStore[gId].lastBumpTs = Date.now();
-          writeJson('bumps.json', bumpStore);
+          writeJson("bumps.json", bumpStore);
           scheduleBumpTimer(gId);
-          console.log(`Auto-bump: detected Disboard bump in guild ${gId}, timer reset.`);
+          console.log(`[Auto-Bump] Disboard bump detected for guild ${gId}`);
         }
       }
     }
-  } catch (e) {
-    console.log('Auto-bump detect error:', e.message);
+  } catch (err) {
+    console.log("Auto-bump error:", err);
   }
 
-  // ===== Anti-promo (skip Justice Chef role) =====
+  // 2) Anti-promo
   try {
-    // Ignore bot messages for promo
     if (!msg.author.bot) {
       const member = msg.member;
-      const isJusticeChef = member?.roles?.cache?.has(JUSTICE_CHEF_ROLE_ID);
 
-      // Staff with Justice Chef can post promo
-      if (!isJusticeChef) {
-        const contentToCheck = [
-          msg.content || '',
-          msg.embeds?.[0]?.title || '',
-          msg.embeds?.[0]?.description || '',
-        ].join(' ');
+      const isStaff = member?.roles?.cache?.some(r => STAFF_ROLE_IDS.includes(r.id));
+      if (!isStaff) {
+        const embedText = msg.embeds
+          ?.map(e => `${e.title || ""} ${e.description || ""}`)
+          .join(" ");
 
-        const matched = PROMO_PATTERNS.find((r) => r.test(contentToCheck));
+        const combined = `${msg.content || ""} ${embedText || ""}`;
+
+        const matched = PROMO_PATTERNS.some(r => r.test(combined));
+
         if (matched) {
-          console.log(
-            `[ANTI-PROMO] Removing promo from ${msg.author.tag} in #${msg.channel.name} | matched: ${matched}`
-          );
-          await msg.delete().catch((err) => {
-            console.log('Failed to delete promo message:', err.message);
-          });
+          console.log(`[ANTI-PROMO] Deleted ad message from ${msg.author.tag}`);
+          await msg.delete().catch(err => console.log("Delete failed:", err.message));
         }
       }
     }
-  } catch (e) {
-    console.log('Anti-promo error:', e.message);
+  } catch (err) {
+    console.log("Anti-promo error:", err);
   }
 
-  // Status guard (runs even if message is from a bot/webhook)
-  await enforceStatusGuard(msg);
+  // 3) Status guard
+  enforceStatusGuard(msg);
 });
 
-// Also watch edits in the status channel (if someone edits "closed" -> "open")
-client.on('messageUpdate', async (_, newMsg) => {
+client.on("messageUpdate", async (_, newMsg) => {
   try {
     const msg = newMsg.partial ? await newMsg.fetch() : newMsg;
     if (!msg.guild) return;
-    await enforceStatusGuard(msg);
-  } catch (e) {
-    console.log('messageUpdate guard error:', e.message);
+    enforceStatusGuard(msg);
+  } catch (err) {
+    console.log("messageUpdate error:", err);
   }
 });
 
-// bulk promo scan
-async function bulkScanPromos(channel, max = 1000) {
-  let removed = 0, lastId = undefined, remaining = Math.min(max, 1000);
-  while (remaining > 0) {
-    const batch = await channel.messages.fetch({ limit: Math.min(100, remaining), before: lastId }).catch(() => null);
-    if (!batch || batch.size === 0) break;
-    for (const [, m] of batch) {
-      if (m.author.bot) continue;
-      const contentToCheck = [
-        m.content || '',
-        m.embeds?.[0]?.title || '',
-        m.embeds?.[0]?.description || '',
-      ].join(' ');
-      if (PROMO_PATTERNS.some(r => r.test(contentToCheck))) {
-        try { await m.delete(); removed++; } catch { }
-      }
-    }
-    lastId = batch.last().id; remaining -= batch.size; await sleep(350);
-  }
-  return removed;
-}
+// ============================================
+// SLASH COMMAND DEFINITIONS
+// ============================================
 
-// ============ Commands ============
-const PAYMENT_FIELDS = [
-  ['Display name', 'name', true],
-  ['Cash App (tag or link)', 'cashapp'],
-  ['Chime (tag)', 'chime'],
-  ['Zelle (email/phone)', 'zelle'],
-  ['PayPal (link or email)', 'paypal'],
-  ['Venmo (link or @)', 'venmo'],
-  ['Apple Pay (phone/email)', 'applepay'],
-  ['Stripe (payment link)', 'stripe'],
-  ['Crypto (address/link)', 'crypto'],
-  ['Other (instructions)', 'other'],
-];
-
+// /scanpromos
 const cmdScanPromos = new SlashCommandBuilder()
-  .setName('scanpromos').setDescription('Delete recent promotional messages here (up to 1000).')
-  .addIntegerOption(o => o.setName('limit').setDescription('Messages to scan (max 1000)').setMinValue(10).setMaxValue(1000))
+  .setName("scanpromos")
+  .setDescription("Delete recent promotional messages here (up to 1000).")
+  .addIntegerOption(o =>
+    o.setName("limit")
+      .setDescription("Messages to scan (max 1000)")
+      .setMinValue(10)
+      .setMaxValue(1000)
+  )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages);
 
+// /setpay (flexible methods)
 const cmdSetPay = new SlashCommandBuilder()
-  .setName('setpay').setDescription('Set payment methods for a staff member.')
-  .addUserOption(o => o.setName('staff').setDescription('Staff user').setRequired(true));
-for (const [label, key, req] of PAYMENT_FIELDS) {
-  const add = (opt) => opt.setName(key).setDescription(label).setRequired(!!req);
-  if (key === 'name') cmdSetPay.addStringOption(add);
-  else cmdSetPay.addStringOption(add);
-}
-
-const cmdDelPay = new SlashCommandBuilder()
-  .setName('delpay')
-  .setDescription('Delete stored payment methods for a staff member.')
+  .setName("setpay")
+  .setDescription("Set payment methods for a staff member (flexible).")
   .addUserOption(o =>
-    o.setName('staff')
-      .setDescription('Staff user whose pay info you want to clear')
-      .setRequired(true)
+    o.setName("staff").setDescription("Staff user").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("name").setDescription("Display name for this staff").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("methods").setDescription("One per line: Method = Value").setRequired(true)
   );
 
-const cmdPay = new SlashCommandBuilder()
-  .setName('pay').setDescription('Show payment options for a staff member.')
-  .addUserOption(o => o.setName('staff').setDescription('Who to pay').setRequired(true))
-  .addNumberOption(o => o.setName('amount').setDescription('Amount in USD').setRequired(true))
-  .addStringOption(o => o.setName('note').setDescription('Optional note'));
+// /delpay
+const cmdDelPay = new SlashCommandBuilder()
+  .setName("delpay")
+  .setDescription("Delete stored payment methods for a staff member.")
+  .addUserOption(o =>
+    o.setName("staff").setDescription("Staff user").setRequired(true)
+  );
 
+// /pay
+const cmdPay = new SlashCommandBuilder()
+  .setName("pay")
+  .setDescription("Show payment options for a staff member.")
+  .addUserOption(o =>
+    o.setName("staff").setDescription("Who is getting paid").setRequired(true)
+  )
+  .addNumberOption(o =>
+    o.setName("amount").setDescription("Amount in USD")
+  )
+  .addStringOption(o =>
+    o.setName("note").setDescription("Optional note")
+  );
+
+// /showpay
+const cmdShowPay = new SlashCommandBuilder()
+  .setName("showpay")
+  .setDescription("Show saved payment methods for a staff member (no amount).")
+  .addUserOption(o =>
+    o.setName("staff").setDescription("Staff user").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("note").setDescription("Optional note")
+  );
+
+// Bump commands
 const cmdBumpConfig = new SlashCommandBuilder()
-  .setName('bump_config').setDescription('Enable Disboard bump reminder in this channel.')
-  .addIntegerOption(o => o.setName('interval').setDescription('Minutes (60–180, default 120)').setMinValue(60).setMaxValue(180))
+  .setName("bump_config")
+  .setDescription("Enable Disboard bump reminder in this channel.")
+  .addIntegerOption(o =>
+    o.setName("interval")
+      .setDescription("Minutes (60–180)")
+      .setMinValue(60)
+      .setMaxValue(180)
+  )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
-const cmdBump = new SlashCommandBuilder().setName('bump').setDescription('Record that you bumped just now.');
-const cmdBumpStatus = new SlashCommandBuilder().setName('bumpstatus').setDescription('Show time until next reminder.');
+const cmdBump = new SlashCommandBuilder()
+  .setName("bump")
+  .setDescription("Record that you bumped just now.");
 
+const cmdBumpStatus = new SlashCommandBuilder()
+  .setName("bumpstatus")
+  .setDescription("Show time until next reminder.");
+
+// Vouch commands
 const cmdVouch = new SlashCommandBuilder()
-  .setName('vouch').setDescription('Submit a vouch for who fulfilled your order.')
-  .addUserOption(o => o.setName('staff').setDescription('Who helped you').setRequired(true))
-  .addStringOption(o => o.setName('message').setDescription('What went well?').setRequired(true))
-  .addAttachmentOption(o => o.setName('image').setDescription('Optional image'))
-  .addChannelOption(o => o.setName('channel').setDescription('Post to (default here)'));
+  .setName("vouch")
+  .setDescription("Submit a vouch for who fulfilled your order.")
+  .addUserOption(o =>
+    o.setName("staff").setDescription("Staff").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("message").setDescription("What went well?").setRequired(true)
+  )
+  .addAttachmentOption(o =>
+    o.setName("image").setDescription("Optional image")
+  )
+  .addChannelOption(o =>
+    o.setName("channel").setDescription("Post to (default here)")
+  );
 
 const cmdVouchCount = new SlashCommandBuilder()
-  .setName('vouchcount').setDescription('Show vouch count and loyalty tier for a user.')
-  .addUserOption(o => o.setName('user').setDescription('User (default you)'));
+  .setName("vouchcount")
+  .setDescription("Show vouch count and loyalty tier for a user.")
+  .addUserOption(o =>
+    o.setName("user").setDescription("User")
+  );
 
+// Announce
 const cmdAnnounce = new SlashCommandBuilder()
-  .setName('announce').setDescription('Post an announcement embed.')
-  .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
-  .addStringOption(o => o.setName('body').setDescription('Body').setRequired(true))
-  .addChannelOption(o => o.setName('channel').setDescription('Target channel (default: here)'))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  .setName("announce")
+  .setDescription("Post an announcement embed.")
+  .addStringOption(o =>
+    o.setName("title").setDescription("Title").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("body").setDescription("Body").setRequired(true)
+  )
+  .addChannelOption(o =>
+    o.setName("channel").setDescription("Target channel")
+  );
 
+// Sayembed
 const cmdSayEmbed = new SlashCommandBuilder()
-  .setName('sayembed').setDescription('Send a styled embed.')
-  .addStringOption(o => o.setName('text').setDescription('Text').setRequired(true));
+  .setName("sayembed")
+  .setDescription("Send a styled embed.")
+  .addStringOption(o =>
+    o.setName("text").setDescription("Text").setRequired(true)
+  );
 
+// Invoice
 const cmdInvoice = new SlashCommandBuilder()
-  .setName('invoice').setDescription('Create a quick invoice/receipt embed.')
-  .addUserOption(o => o.setName('customer').setDescription('Customer').setRequired(true))
-  .addNumberOption(o => o.setName('amount').setDescription('Total amount').setRequired(true))
-  .addStringOption(o => o.setName('items').setDescription('Items/notes').setRequired(true));
+  .setName("invoice")
+  .setDescription("Create a quick invoice/receipt embed.")
+  .addUserOption(o =>
+    o.setName("customer").setDescription("Customer").setRequired(true)
+  )
+  .addNumberOption(o =>
+    o.setName("amount").setDescription("Total amount").setRequired(true)
+  )
+  .addStringOption(o =>
+    o.setName("items").setDescription("Items/notes").setRequired(true)
+  );
 
+// UE Inspect
 const cmdUEInspect = new SlashCommandBuilder()
-  .setName('ueinspect').setDescription('Forward an Uber Eats group link to the tickets channel.')
-  .addStringOption(o => o.setName('url').setDescription('Uber Eats group link').setRequired(true));
+  .setName("ueinspect")
+  .setDescription("Forward an Uber Eats group link to the tickets channel.")
+  .addStringOption(o =>
+    o.setName("url").setDescription("Uber Eats link").setRequired(true)
+  );
 
+// Closeticket
 const cmdCloseTicket = new SlashCommandBuilder()
-  .setName('closeticket').setDescription('Open close panel: Save & Close (with transcript) or Delete Only.')
+  .setName("closeticket")
+  .setDescription("Open close panel: Save & Close (with transcript) or Delete Only.")
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
 
+// Claim
+const cmdClaim = new SlashCommandBuilder()
+  .setName("claim")
+  .setDescription("Claim this ticket and rename it.")
+  .addUserOption(o =>
+    o.setName("user").setDescription("User to attach this ticket to").setRequired(true)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
+
+// Help
 const cmdHelp = new SlashCommandBuilder()
-  .setName('help').setDescription('Show bot commands.');
+  .setName("help")
+  .setDescription("Show bot commands.");
 
 const COMMANDS = [
-  cmdScanPromos, cmdSetPay, cmdDelPay, cmdPay,
-  cmdBumpConfig, cmdBump, cmdBumpStatus,
-  cmdVouch, cmdVouchCount,
-  cmdAnnounce, cmdSayEmbed, cmdInvoice,
-  cmdUEInspect, cmdCloseTicket, cmdHelp,
+  cmdScanPromos,
+  cmdSetPay,
+  cmdDelPay,
+  cmdPay,
+  cmdShowPay,
+  cmdBumpConfig,
+  cmdBump,
+  cmdBumpStatus,
+  cmdVouch,
+  cmdVouchCount,
+  cmdAnnounce,
+  cmdSayEmbed,
+  cmdInvoice,
+  cmdUEInspect,
+  cmdCloseTicket,
+  cmdClaim,
+  cmdHelp
 ].map(c => c.toJSON());
 
 async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: COMMANDS });
-  console.log('✅ Commands registered.');
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+  await rest.put(
+    Routes.applicationCommands(process.env.CLIENT_ID),
+    { body: COMMANDS }
+  );
+  console.log("✅ Slash commands registered");
 }
 
-// ============ PAY helpers ============
-const isHttp = (s) => /^https?:\/\//i.test(s);
-function buildPayEmbed(invoker, staffUser, info, amount, note) {
-  const pairs = [
-    ['Cash App', 'cashapp'], ['Chime', 'chime'], ['Zelle', 'zelle'], ['PayPal', 'paypal'],
-    ['Venmo', 'venmo'], ['Apple Pay', 'applepay'], ['Stripe', 'stripe'], ['Crypto', 'crypto'], ['Other', 'other'],
-  ];
-  const lines = [];
-  for (const [label, key] of pairs) if (info[key]) lines.push(`**${label}:** ${info[key]}`);
-  if (!lines.length) lines.push('_No payment fields set. Ask the staff to run **/setpay**._');
+// ============================================
+// FLEXIBLE PAYMENT SYSTEM
+// ============================================
 
+// info = { name: "John", methods: { "Chime": "chime$john", "Stripe": "https://stripe.link/..." } }
+
+function buildPayEmbed(requester, staff, info, amount, note, openerId) {
   const e = new EmbedBuilder()
     .setColor(0x22c55e)
-    .setTitle(`💸 Pay ${info.name || staffUser.tag}`)
-    .setThumbnail(staffUser.displayAvatarURL({ extension: 'png', size: 128 }))
-    .setDescription([`**Amount:** ${fmtMoney(amount)}`, ...lines, '', 'Use the buttons to copy values or open links.'].join('\n'))
-    .setFooter({ text: `Requested by ${invoker.tag}` })
+    .setTitle(`💸 Payment → ${info.name}`)
+    .setFooter({ text: `Requested by ${requester.tag}` })
     .setTimestamp();
-  if (note) e.addFields({ name: 'Note', value: note, inline: false });
+
+  if (openerId) {
+    e.addFields({ name: "Customer", value: `<@${openerId}>`, inline: true });
+  }
+
+  if (amount != null) {
+    e.addFields({ name: "Amount", value: fmtMoney(amount), inline: true });
+  }
+
+  if (note) {
+    e.addFields({ name: "Note", value: note, inline: false });
+  }
+
+  const methodFields = Object.entries(info.methods || {}).map(([method, value]) => ({
+    name: method,
+    value: value,
+    inline: true
+  }));
+
+  if (methodFields.length) e.addFields(methodFields);
+
   return e;
 }
+
+// Auto-split buttons into rows of max 5
 function buildPayButtons(info) {
-  const copyRow = new ActionRowBuilder();
-  const linkRow = new ActionRowBuilder();
-  const addCopy = (k, l) => info[k] && copyRow.addComponents(
-    new ButtonBuilder().setCustomId(`copy:${k}`).setLabel(`Copy ${l}`).setStyle(ButtonStyle.Secondary)
-  );
-  const addLink = (k, l) => info[k] && isHttp(info[k]) && linkRow.addComponents(
-    new ButtonBuilder().setLabel(`Open ${l}`).setStyle(ButtonStyle.Link).setURL(info[k])
-  );
-  const pairs = [
-    ['cashapp', 'Cash App'], ['chime', 'Chime'], ['zelle', 'Zelle'], ['paypal', 'PayPal'],
-    ['venmo', 'Venmo'], ['applepay', 'Apple Pay'], ['stripe', 'Stripe'], ['crypto', 'Crypto'], ['other', 'Other']
-  ];
-  for (const [k, l] of pairs) { addCopy(k, l); addLink(k, l); }
-  const rows = []; if (copyRow.components.length) rows.push(copyRow); if (linkRow.components.length) rows.push(linkRow); return rows;
-}
+  const methods = Object.entries(info.methods || {});
+  const rows = [];
+  let currentRow = new ActionRowBuilder();
 
-// Map payment keys -> labels used in the embed description
-const PAY_LABEL_MAP = {
-  cashapp: 'Cash App',
-  chime: 'Chime',
-  zelle: 'Zelle',
-  paypal: 'PayPal',
-  venmo: 'Venmo',
-  applepay: 'Apple Pay',
-  stripe: 'Stripe',
-  crypto: 'Crypto',
-  other: 'Other',
-};
+  for (const [method, value] of methods) {
+    // Copy button
+    const encodedName = encodeURIComponent(method);
 
-// ============ Bump reminder ============
-function scheduleBumpTimer(guildId) {
-  const entry = bumpStore[guildId];
-  if (!entry || !entry.channelId) return;
-  global._bumpTimers = global._bumpTimers || {};
-  if (global._bumpTimers[guildId]) clearTimeout(global._bumpTimers[guildId]);
-  const intervalMs = (entry.intervalMin || 120) * 60 * 1000;
-  const last = entry.lastBumpTs || Date.now();
-  const dueIn = Math.max(0, (last + intervalMs) - Date.now());
-  global._bumpTimers[guildId] = setTimeout(async () => {
-    try {
-      const ch = await client.channels.fetch(entry.channelId);
-      if (ch) {
-        const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Disboard bump helper')
-          .setDescription('Run **/bump** in this channel every ~2 hours to keep the server visible on Disboard.\n\n_No pings were used._');
-        await ch.send({ embeds: [embed] });
+    // If row full, push and start new
+    if (currentRow.components.length === 5) {
+      rows.push(currentRow);
+      currentRow = new ActionRowBuilder();
+    }
+
+    currentRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`pay:copy:${encodedName}`)
+        .setStyle(ButtonStyle.Secondary)
+        .setLabel(method.length > 20 ? method.slice(0, 17) + "..." : method)
+    );
+
+    // If it's a URL, also add an "Open" link button
+    if (/^https?:\/\//i.test(value)) {
+      if (currentRow.components.length === 5) {
+        rows.push(currentRow);
+        currentRow = new ActionRowBuilder();
       }
-    } catch { }
-    entry.lastBumpTs = Date.now(); writeJson('bumps.json', bumpStore); scheduleBumpTimer(guildId);
-  }, dueIn);
+
+      currentRow.addComponents(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel(`Open ${method.length > 16 ? method.slice(0, 13) + "..." : method}`)
+          .setURL(value)
+      );
+    }
+  }
+
+  if (currentRow.components.length > 0) {
+    rows.push(currentRow);
+  }
+
+  return rows;
 }
 
-// ============ UE Inspect (forward link) ============
-const UE_REGEX = /\bhttps?:\/\/(?:www\.)?eats\.uber\.com\/[\w\-\/\?=&#.%]+/i;
-async function forwardUE(link, fromUser) {
-  try {
-    const ch = await client.channels.fetch(UBER_TICKETS_CHANNEL);
-    if (!ch) return false;
-    const e = new EmbedBuilder().setColor(0x0f172a).setTitle('Uber Eats group link received')
-      .setDescription(`[Open the group link](${link})\n\n_Use your agent workflow to review/fulfill._`)
-      .setFooter({ text: `Submitted by ${fromUser.tag}` }).setTimestamp();
-    await ch.send({ embeds: [e] }); return true;
-  } catch { return false; }
+// ============================================
+// TICKET OPENER DETECTION (TicketTool-aware)
+// ============================================
+
+async function fetchAllMessages(channel, limit = 300) {
+  let all = [];
+  let lastId = undefined;
+
+  while (all.length < limit) {
+    const batch = await channel.messages.fetch({
+      limit: Math.min(limit - all.length, 100),
+      before: lastId
+    });
+
+    if (!batch.size) break;
+
+    all.push(...batch.values());
+    lastId = batch.last().id;
+  }
+
+  return all.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 }
 
-// ============ Transcript (mirror images locally + hosted URL + file upload) ============
-function escapeHTML(s = '') { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
-function isImageName(name = '') { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name); }
-async function downloadTo(filePath, url) {
-  const res = await axios({ method: 'GET', url, responseType: 'stream' });
-  await new Promise((resolve, reject) => {
-    const w = fs.createWriteStream(filePath); res.data.pipe(w);
-    w.on('finish', resolve); w.on('error', reject);
-  });
-}
-function localAttachPath(name) { return path.join(ATTACH_DIR, name); }
-function localAttachUrl(name) { return `${externalBase()}/attachments/${encodeURIComponent(name)}`; }
+// Ticket opener:
+// 1) First TicketTool bot message that mentions a user
+// 2) First human non-staff message
+// 3) Any first human message
+async function findOpener(channel, messages) {
+  // 1) TicketTool bot welcome
+  for (const msg of messages) {
+    if (msg.author?.id === TICKETTOOL_BOT_ID && msg.mentions?.users?.size > 0) {
+      const mentioned = msg.mentions.users.first();
+      if (mentioned) return mentioned.id;
+    }
+  }
 
-function renderEmbedBlock(embed) {
-  const e = embed.data || embed;
-  const title = e.title ? `<div class="e-title">${escapeHTML(e.title)}</div>` : '';
-  const desc = e.description ? `<div class="e-desc">${escapeHTML(e.description)}</div>` : '';
-  const author = e.author?.name ? `<div class="e-author">by ${escapeHTML(e.author.name)}</div>` : '';
-  const fields = (e.fields || []).map(f => `<div class="e-field"><div class="e-name">${escapeHTML(f.name || '')}</div><div class="e-value">${escapeHTML(f.value || '')}</div></div>`).join('');
-  const thumb = e.thumbnail?.url ? `<img class="e-thumb" src="${e.thumbnail.url}">` : '';
-  const image = e.image?.url ? `<img class="e-image" src="${e.image.url}">` : '';
-  return `<div class="embed">${title}${author}${desc}${fields}${thumb}${image}</div>`;
+  // 2) First human non-staff
+  for (const msg of messages) {
+    if (!msg.author || msg.author.bot) continue;
+    const member = msg.member;
+    if (member?.roles?.cache?.some(r => STAFF_ROLE_IDS.includes(r.id))) continue;
+    return msg.author.id;
+  }
+
+  // 3) First human at all
+  const firstHuman = messages.find(m => !m.author?.bot);
+  return firstHuman?.author?.id || null;
 }
-function replaceMentionsWithNames(text, msg) {
-  if (!text) return '';
+
+// ============================================
+// VOUCH → CUSTOMER TIER ROLES
+// ============================================
+
+// Tier thresholds (you said previous lower values felt better)
+function tierForCount(count) {
+  if (count >= 12) {
+    return { label: "VILTRUMITE (Loyal Customer)", roleId: VILTRUMITE_ROLE_ID };
+  } else if (count >= 7) {
+    return { label: "Frequent Buyer", roleId: FREQUENT_BUYER_ROLE_ID };
+  } else if (count >= 3) {
+    return { label: "Verified Buyer", roleId: VERIFIED_BUYER_ROLE_ID };
+  }
+  return null;
+}
+
+// Apply roles based on vouch count; never downgrade VILTRUMITE
+async function applyCustomerRoles(guild, member, count) {
+  if (!guild || !member) return;
+
+  // If they already have highest role, don't touch
+  if (member.roles.cache.has(VILTRUMITE_ROLE_ID)) return;
+
+  const tier = tierForCount(count);
+  if (!tier) return;
+
+  const role = guild.roles.cache.get(tier.roleId);
+  if (!role) return;
+
+  await member.roles.add(role).catch(() => {});
+
+  // Optional: do NOT remove lower tiers to avoid surprises
+  // If you ever want strict ladder, we can remove lower roles here.
+}
+
+// ============================================
+// TRANSCRIPT HELPERS
+// ============================================
+
+// Replace mentions with readable names
+function replaceMentions(text, msg) {
+  if (!text) return "";
   let out = text;
-  const users = msg.mentions?.users;
-  if (users && users.size) for (const [, u] of users) out = out.replace(new RegExp(`<@!?${u.id}>`, 'g'), `@${u.username}`);
-  const chans = msg.mentions?.channels;
-  if (chans && chans.size) for (const [, c] of chans) out = out.replace(new RegExp(`<#${c.id}>`, 'g'), `#${c.name}`);
+
+  // Users
+  msg.mentions?.users?.forEach(u => {
+    out = out.replace(new RegExp(`<@!?${u.id}>`, "g"), `@${u.username}`);
+  });
+
+  // Channels
+  msg.mentions?.channels?.forEach(c => {
+    out = out.replace(new RegExp(`<#${c.id}>`, "g"), `#${c.name}`);
+  });
+
   return out;
 }
-function safeAvatarUrl(user) {
-  try { return user?.displayAvatarURL?.({ extension: 'png', size: 64 }) || user?.displayAvatarURL?.() || ''; } catch { return ''; }
+
+// Render embed inside transcript
+function renderEmbedBlock(embed) {
+  const e = embed.data || embed;
+
+  const title = e.title ? `<div class="e-title">${escapeHTML(e.title)}</div>` : "";
+  const desc = e.description ? `<div class="e-desc">${escapeHTML(e.description)}</div>` : "";
+
+  const fields = (e.fields || [])
+    .map(f => `
+      <div class="e-field">
+        <strong>${escapeHTML(f.name)}:</strong>
+        <div>${escapeHTML(f.value)}</div>
+      </div>
+    `)
+    .join("");
+
+  const img = e.image?.url ? `<img class="e-image" src="${e.image.url}">` : "";
+  const thumb = e.thumbnail?.url ? `<img class="e-thumb" src="${e.thumbnail.url}">` : "";
+
+  return `<div class="embed">${title}${desc}${fields}${thumb}${img}</div>`;
 }
 
-async function generateTranscriptHTML({ guild, channel, opener, closer, messages, ticketId }) {
-  const avatarCache = new Map(); // userId -> local URL
-  async function getLocalAvatar(u) {
-    if (!u) return 'https://cdn.discordapp.com/embed/avatars/0.png';
-    const key = u.id || u.user?.id || u.tag || Math.random().toString(36).slice(2);
-    if (avatarCache.has(key)) return avatarCache.get(key);
-    const url = safeAvatarUrl(u.user || u) || 'https://cdn.discordapp.com/embed/avatars/0.png';
+// Download avatar to local server
+async function getLocalAvatar(userObj) {
+  if (!userObj) return "https://cdn.discordapp.com/embed/avatars/0.png";
+
+  const u = userObj.user || userObj;
+
+  const url = safeAvatarUrl(u) || "https://cdn.discordapp.com/embed/avatars/0.png";
+  const fname = `avatar-${u.id}.png`;
+  const dest = localAttachPath(fname);
+
+  if (!fs.existsSync(dest)) {
     try {
-      const name = `avatar-${key}.png`;
-      const dest = localAttachPath(name);
-      if (!fs.existsSync(dest)) await downloadTo(dest, url);
-      const out = localAttachUrl(name);
-      avatarCache.set(key, out);
-      return out;
+      await downloadTo(dest, url);
     } catch {
       return url;
     }
   }
 
-  const blocks = [];
+  return localAttachUrl(fname);
+}
+
+// Generate transcript HTML
+async function generateTranscriptHTML({ guild, channel, opener, closer, messages, ticketId }) {
+  let blocks = [];
+
   for (const m of messages) {
     const avatar = await getLocalAvatar(m.member || m.author);
-    const name = m.member?.nickname || m.author?.globalName || m.author?.username || m.author?.tag || 'Unknown';
-    const time = new Date(m.createdTimestamp || m.createdAt || Date.now()).toLocaleString();
-    const contentRaw = m.content || '';
-    const content = contentRaw ? `<div class="msg-text">${escapeHTML(replaceMentionsWithNames(contentRaw, m))}</div>` : '';
-    const embeds = (m.embeds || []).map(e => renderEmbedBlock(e)).join('');
+
+    const name =
+      m.member?.nickname ||
+      m.author?.globalName ||
+      m.author?.username ||
+      m.author?.tag ||
+      "Unknown";
+
+    const time = new Date(m.createdTimestamp).toLocaleString();
+
+    const content = m.content
+      ? `<div class="msg-text">${escapeHTML(replaceMentions(m.content, m))}</div>`
+      : "";
+
+    const embedBlocks = (m.embeds || []).map(e => renderEmbedBlock(e)).join("");
+
     const atts = [];
     if (m.attachments?.size) {
       for (const a of m.attachments.values()) {
+        const fname = `att-${m.id}-${a.name}`.replace(/[^a-z0-9._-]/gi, "_");
+        const dest = localAttachPath(fname);
+
         try {
-          if ((a.contentType && a.contentType.startsWith('image/')) || isImageName(a.name || '')) {
-            const fname = `att-${m.id}-${a.name || 'image'}`.replace(/[^a-z0-9._-]/ig, '_');
-            const dest = localAttachPath(fname);
-            if (!fs.existsSync(dest)) await downloadTo(dest, a.url);
-            atts.push(`<img class="att-img" src="${localAttachUrl(fname)}" alt="${escapeHTML(a.name || 'image')}">`);
-          } else {
-            atts.push(`<a class="att-file" href="${a.url}" target="_blank" rel="noreferrer">${escapeHTML(a.name || 'file')}</a>`);
-          }
+          await downloadTo(dest, a.url);
+          atts.push(`<img class="att-img" src="${localAttachUrl(fname)}">`);
         } catch {
-          atts.push(`<a class="att-file" href="${a.url}" target="_blank" rel="noreferrer">${escapeHTML(a.name || 'file')}</a>`);
+          atts.push(
+            `<a class="att-file" href="${a.url}" target="_blank">${escapeHTML(a.name || "file")}</a>`
+          );
         }
       }
     }
-    blocks.push(`<div class="msg">
-      <img class="avatar" src="${avatar}">
-      <div class="body">
-        <div class="head"><span class="name">${escapeHTML(name)}</span><span class="time">${escapeHTML(time)}</span></div>
-        ${content}${embeds}${atts.join('')}
+
+    blocks.push(`
+      <div class="msg">
+        <img class="avatar" src="${avatar}">
+        <div class="body">
+          <div class="head">
+            <span class="name">${escapeHTML(name)}</span>
+            <span class="time">${escapeHTML(time)}</span>
+          </div>
+          ${content}${embedBlocks}${atts.join("")}
+        </div>
       </div>
-    </div>`);
+    `);
   }
 
-  const openedBy = opener ? `@${escapeHTML(opener.displayName || opener.user?.username || opener.tag || opener.id)}` : 'Unknown';
-  const closedBy = closer ? `@${escapeHTML(closer.displayName || closer.user?.username || closer.tag || closer.id)}` : 'Unknown';
-
-  return `<!doctype html>
+  return `
+<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Transcript ${escapeHTML(channel.name || 'ticket')}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Transcript — ${escapeHTML(channel.name)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
 <style>
-  :root{color-scheme:dark light}
-  body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e5e7eb;margin:0;padding:24px}
-  .card{background:#0f1620;border:1px solid #1f2937;border-radius:12px;max-width:960px;margin:0 auto;padding:20px}
-  h1{margin:0 0 8px;font-size:24px}
-  .meta{opacity:.8;margin-bottom:16px}
-  .badge{display:inline-block;background:#111827;border:1px solid #374151;border-radius:8px;padding:6px 10px;margin:4px 8px 4px 0}
-  .msg{display:flex;gap:12px;padding:12px;border-bottom:1px solid #1f2937}
-  .msg:last-child{border-bottom:none}
-  .avatar{width:40px;height:40px;border-radius:999px}
-  .body{flex:1}
-  .head{font-size:14px;margin-bottom:4px}
-  .name{font-weight:600;margin-right:8px}
-  .time{opacity:.7}
-  .msg-text{white-space:pre-wrap;line-height:1.4}
-  .embed{border-left:3px solid #3b82f6;background:#0c1320;padding:10px 12px;margin:8px 0;border-radius:6px}
-  .e-title{font-weight:700;margin-bottom:6px}
-  .e-author{opacity:.8;margin-bottom:6px}
-  .e-field{margin:6px 0}
-  .e-name{font-weight:600;margin-bottom:2px}
-  .e-thumb{max-height:64px;margin-top:6px}
-  .e-image{max-width:100%;margin-top:8px;border-radius:6px}
-  .att-img{max-width:100%;border-radius:6px;margin-top:8px}
-  .att-file{display:inline-block;margin-top:8px}
-  footer{opacity:.6;font-size:12px;margin-top:14px}
+body { background:#0b0f14; color:#e5e7eb; font-family:Arial; margin:0; padding:24px; }
+.card { background:#0f1620; padding:20px; border-radius:12px; max-width:900px; margin:auto; }
+.badge { display:inline-block; background:#111827; padding:6px 10px; border-radius:8px; margin-right:8px; }
+.msg { display:flex; border-bottom:1px solid #1f2937; padding:12px 0; gap:12px; }
+.avatar { width:40px; height:40px; border-radius:50%; }
+.msg-text { white-space:pre-wrap; }
+.embed { background:#0c1320; border-left:3px solid #3b82f6; padding:10px; margin-top:6px; }
+.att-img { max-width:100%; border-radius:6px; margin-top:8px; }
 </style>
+
 </head>
 <body>
   <div class="card">
     <h1>Ticket Transcript</h1>
-    <div class="meta">
-      <span class="badge"><b>Guild:</b> ${escapeHTML(guild?.name || '')}</span>
-      <span class="badge"><b>Channel:</b> ${escapeHTML(channel?.name || '')}</span>
-      <span class="badge"><b>Ticket ID:</b> ${escapeHTML(ticketId || '')}</span>
-      <span class="badge"><b>Opened by:</b> ${escapeHTML(openedBy)}</span>
-      <span class="badge"><b>Closed by:</b> ${escapeHTML(closedBy)}</span>
-      <span class="badge"><b>Generated:</b> ${escapeHTML(new Date().toLocaleString())}</span>
-    </div>
-    ${blocks.join('') || '<i>No messages.</i>'}
-    <footer>Generated by INVINCIBLE EATS</footer>
+
+    <div class="badge"><b>Guild:</b> ${escapeHTML(guild.name)}</div>
+    <div class="badge"><b>Channel:</b> ${escapeHTML(channel.name)}</div>
+    <div class="badge"><b>Ticket ID:</b> ${escapeHTML(ticketId)}</div>
+    <div class="badge"><b>Opened By:</b> @${escapeHTML(
+      opener?.user?.username || opener?.displayName || "Unknown"
+    )}</div>
+    <div class="badge"><b>Closed By:</b> @${escapeHTML(
+      closer?.user?.username || closer?.displayName || "Unknown"
+    )}</div>
+
+    ${blocks.join("")}
+
+    <footer style="opacity:.5; margin-top:20px; font-size:12px;">
+      Generated by INVINCIBLE EATS
+    </footer>
   </div>
 </body>
-</html>`;
+</html>
+  `;
 }
 
-function findOpenerFromTopicOrMessages(channel, messages) {
-  const topic = channel.topic || '';
-  const m = topic.match(/User ID:\s*(\d{5,})/i);
-  if (m) return m[1];
-  for (const msg of messages.slice(0, 15)) {
-    for (const e of msg.embeds || []) {
-      const fields = (e.data?.fields || e.fields || []);
-      const f = fields.find(x => /user/i.test(x.name || ''));
-      const id = f?.value?.match?.(/<@!?(\d{5,})>/)?.[1];
-      if (id) return id;
-    }
-  }
-  for (const msg of messages) {
-    const mention = msg.content?.match(/<@!?(\d{5,})>/);
-    if (mention) return mention[1];
-  }
-  const firstHuman = messages.find(m => !m.author?.bot);
-  if (firstHuman) return firstHuman.author.id;
-  return null;
-}
-
-async function fetchAllMessages(channel, limit = 1000) {
-  let all = [], lastId = undefined;
-  while (all.length < limit) {
-    const batch = await channel.messages.fetch({ limit: Math.min(100, limit - all.length), before: lastId }).catch(() => null);
-    if (!batch || batch.size === 0) break;
-    all = all.concat([...batch.values()]);
-    lastId = batch.last().id;
-  }
-  return all.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-}
-
+// Main transcript generator
 async function generateAndSendTranscript(interaction, mode) {
   const channel = interaction.channel;
-  if (!channel) {
-    console.log('Transcript error: interaction has no channel');
-    return;
-  }
+  const guild = interaction.guild;
+
+  if (!channel || !guild) return;
 
   const messages = await fetchAllMessages(channel, 1000);
-  const openerId = findOpenerFromTopicOrMessages(channel, messages);
-  const openerMember = openerId ? await channel.guild.members.fetch(openerId).catch(() => null) : null;
-  const closerMember = await channel.guild.members.fetch(interaction.user.id).catch(() => null);
+  const openerId = await findOpener(channel, messages);
+
+  const opener = openerId ? await guild.members.fetch(openerId).catch(() => null) : null;
+  const closer = await guild.members.fetch(interaction.user.id).catch(() => null);
 
   const ticketId = `${Date.now()}`;
+
   const html = await generateTranscriptHTML({
-    guild: interaction.guild,
+    guild,
     channel,
-    opener: openerMember,
-    closer: closerMember,
+    opener,
+    closer,
     messages,
-    ticketId,
+    ticketId
   });
 
-  // -------- write HTML to public transcripts dir for hosted URL --------
-  const fname = `ticket-${channel.id}-${ticketId}.html`;
-  const fpath = path.join(TRANSCRIPT_DIR, fname);
-  fs.writeFileSync(fpath, html, 'utf8');
-  const hostedUrl = `${externalBase()}/transcripts/${encodeURIComponent(fname)}`;
+  const fileName = `ticket-${channel.id}-${ticketId}.html`;
+  const filePath = path.join(TRANSCRIPT_DIR, fileName);
 
-  // -------- also write a temp copy for attaching to Discord messages --------
-  const tempPath = path.join(os.tmpdir(), fname);
-  fs.writeFileSync(tempPath, html, 'utf8');
+  fs.writeFileSync(filePath, html, "utf8");
 
-  const attachment = new AttachmentBuilder(tempPath, { name: fname });
+  const hostedUrl = `${externalBase()}/transcripts/${encodeURIComponent(fileName)}`;
 
-  // ---------- pick target log channel (log channel -> fallback to ticket channel) ----------
-  let targetCh = channel;
-  const logId = TRANSCRIPT_LOG_ID;
+  const tempPath = path.join(os.tmpdir(), fileName);
+  fs.writeFileSync(tempPath, html, "utf8");
+  const attachment = new AttachmentBuilder(tempPath, { name: fileName });
 
-  if (logId) {
-    try {
-      console.log('Transcript: trying log channel ID:', logId);
-      const fetched = await client.channels.fetch(logId);
-      if (fetched) {
-        console.log('Transcript: SUCCESS → using log channel:', fetched.id, fetched.name);
-        targetCh = fetched;
-      } else {
-        console.log(`Transcript log: channel ID ${logId} not found, using ticket channel instead.`);
-      }
-    } catch (e) {
-      console.log(`Transcript log: failed to fetch channel ${logId}, using ticket channel instead.`, e.message);
-    }
-  } else {
-    console.log('Transcript log: TRANSCRIPT_LOG_ID is empty, using ticket channel instead.');
-  }
+  // Log to transcript channel
+  const logCh = client.channels.cache.get(TRANSCRIPT_LOG_ID) || channel;
 
-  // ---------- shared fields + button ----------
-  const baseFields = [
-    { name: 'Channel', value: `#${channel.name}`, inline: true },
-    { name: 'Closed By', value: `${interaction.user}`, inline: true },
-    { name: 'Opened By', value: openerMember ? `${openerMember}` : 'Unknown', inline: true },
-    { name: 'Messages', value: String(messages.length), inline: true },
-    { name: 'Ticket ID', value: ticketId, inline: true },
-  ];
+  const logEmbed = new EmbedBuilder()
+    .setColor(0x34d399)
+    .setTitle("📦 Ticket Closed (Logged)")
+    .setDescription(
+      `Transcript generated.\n\n[Open transcript in browser](${hostedUrl})`
+    )
+    .addFields(
+      { name: "Channel", value: `#${channel.name}`, inline: true },
+      { name: "Closed By", value: `${interaction.user}`, inline: true },
+      { name: "Opened By", value: opener ? `${opener}` : "Unknown", inline: true },
+      { name: "Messages", value: String(messages.length), inline: true },
+      { name: "Ticket ID", value: ticketId, inline: true }
+    )
+    .setTimestamp();
 
-  const viewButtonRow = new ActionRowBuilder().addComponents(
+  const logRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setStyle(ButtonStyle.Link)
-      .setLabel('View Transcript')
-      .setURL(hostedUrl),
+      .setLabel("View Transcript")
+      .setURL(hostedUrl)
   );
 
-  // ---------- send to log (or ticket) channel ----------
-  try {
-    const logEmbed = new EmbedBuilder()
-      .setColor(0x34d399)
-      .setTitle('📦 Ticket Closed (Logged)')
-      .setDescription(
-        [
-          'Transcript generated and logged.',
-          '',
-          `[Open transcript in browser](${hostedUrl})`,
-          '',
-          'A full HTML copy of the transcript is attached to this message.',
-        ].join('\n'),
-      )
-      .addFields(baseFields)
-      .setTimestamp();
+  await logCh.send({
+    embeds: [logEmbed],
+    components: [logRow],
+    files: [attachment]
+  });
 
-    await targetCh.send({
-      embeds: [logEmbed],
-      components: [viewButtonRow],
-      files: [attachment],
-    });
-  } catch (e) {
-    console.log('Transcript log send failed:', e.message);
-  }
-
-  // ---------- DM ticket opener (embed + button + HTML file) ----------
-  if (openerMember) {
+  // DM to opener
+  if (opener) {
     try {
       const dmEmbed = new EmbedBuilder()
         .setColor(0x38bdf8)
-        .setTitle('📁 Your Ticket Transcript')
+        .setTitle("📁 Your Ticket Transcript")
         .setDescription(
-          [
-            `Here is your transcript for **#${channel.name}**.`,
-            '',
-            'You can open it using the button below, or download the attached HTML file and open it in your browser.',
-          ].join('\n'),
+          `Here is your transcript for **#${channel.name}**.\n\nUse the button below or download the attached file.`
         )
-        .addFields(baseFields)
         .setTimestamp();
 
       const dmRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setStyle(ButtonStyle.Link)
-          .setLabel('Open Transcript')
-          .setURL(hostedUrl),
+          .setLabel("Open Transcript")
+          .setURL(hostedUrl)
       );
 
-      await openerMember.send({
+      await opener.send({
         embeds: [dmEmbed],
         components: [dmRow],
-        files: [attachment],
-      }).catch(() => { });
-    } catch (e) {
-      console.log('Transcript DM to opener failed:', e.message);
+        files: [attachment]
+      });
+    } catch (err) {
+      console.log("DM failed:", err.message);
     }
   }
 
-  // ---------- confirmation in the ticket channel ----------
-  const confirmRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setStyle(ButtonStyle.Link)
-      .setLabel('View Transcript')
-      .setURL(hostedUrl),
-  );
-
+  // Confirm inside ticket
   const finalEmbed = new EmbedBuilder()
     .setColor(0x10b981)
-    .setTitle('✅ Ticket Closed')
-    .setDescription(
-      [
-        'This ticket has been closed and the transcript has been saved.',
-        '',
-        '• Logged in the transcript log channel (or here if no log channel is set).',
-        '• DM sent to the ticket opener (if DMs are open).',
-      ].join('\n'),
+    .setTitle("✅ Ticket Closed")
+    .setDescription("Transcript saved, logged, and DM sent (if possible).")
+    .addFields(
+      { name: "Ticket ID", value: ticketId },
+      { name: "Messages", value: String(messages.length) }
     )
-    .addFields(baseFields)
-    .setFooter({ text: `Ticket ID: ${ticketId}` })
     .setTimestamp();
 
   await interaction.followUp({
     embeds: [finalEmbed],
-    components: [confirmRow],
-    ephemeral: false,
+    components: [logRow],
+    ephemeral: false
   });
 
-  // ---------- delete ticket if needed ----------
-  if (mode === 'delete') {
-    setTimeout(() => channel.delete().catch(() => { }), 3000);
+  if (mode === "delete") {
+    setTimeout(() => channel.delete().catch(() => {}), 2500);
   }
 }
 
-// ============ Ready + interactions ============
-client.once('ready', () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
-  for (const gid of Object.keys(bumpStore)) scheduleBumpTimer(gid);
-});
+// ============================================
+// INTERACTION HANDLER
+// ============================================
 
-client.on('interactionCreate', async (interaction) => {
+client.on("interactionCreate", async interaction => {
   try {
-    // Buttons (pay copy + ticket close buttons)
+    // ========== BUTTONS ==========
     if (interaction.isButton()) {
       const id = interaction.customId;
-      if (id.startsWith('copy:')) {
-        const key = id.split(':')[1]; // e.g. cashapp
-        const label = PAY_LABEL_MAP[key] || key;
+
+      // Payment copy buttons
+      if (id.startsWith("pay:copy:")) {
+        const encoded = id.split(":")[2];
+        const methodName = decodeURIComponent(encoded);
 
         const embed = interaction.message.embeds?.[0];
-        const desc = embed?.data?.description || embed?.description || '';
+        const fields = embed?.data?.fields || embed?.fields || [];
+        const field = fields.find(f => f.name === methodName);
 
-        // Match "**Cash App:** value"
-        const escapedLabel = label.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-        const m = new RegExp(`\\*\\*${escapedLabel}:\\*\\*\\s(.+?)(?:\\n|$)`, 'i').exec(desc);
-        const value = (m && m[1]) ? m[1].trim() : null;
-        if (!value) return interaction.reply({ content: 'Not found.', ephemeral: true });
+        const value = field?.value?.trim();
+        if (!value) {
+          return interaction.reply({ content: "Not found.", ephemeral: true });
+        }
+
         return interaction.reply({ content: value, ephemeral: true });
       }
-      if (id === 'ticket:save_close') {
+
+      // Close ticket → Save & Close
+      if (id === "ticket:save_close") {
         await interaction.deferReply({ ephemeral: true });
-        await generateAndSendTranscript(interaction, 'delete');
+        await generateAndSendTranscript(interaction, "delete");
         return;
       }
-      if (id === 'ticket:delete_only') {
+
+      // Close ticket → Delete Only
+      if (id === "ticket:delete_only") {
         await interaction.deferReply({ ephemeral: true });
-        await interaction.followUp({ content: 'Deleting this ticket...', ephemeral: true });
-        setTimeout(() => interaction.channel.delete().catch(() => { }), 1500);
+        await interaction.followUp({ content: "Deleting this ticket...", ephemeral: true });
+        setTimeout(() => interaction.channel.delete().catch(() => {}), 1800);
         return;
       }
+
+      return;
     }
 
+    // ========== SLASH COMMANDS ==========
     if (!interaction.isChatInputCommand()) return;
+    const cmd = interaction.commandName;
 
-    // /help
-    if (interaction.commandName === 'help') {
-      const e = new EmbedBuilder().setColor(0x2dd4bf).setTitle('INVINCIBLE EATS — Commands').setDescription([
-        '**Tickets**: /closeticket',
-        '**Payments**: /setpay /delpay /pay',
-        '**Orders**: /ueinspect',
-        '**Vouch**: /vouch /vouchcount',
-        '**Moderation**: /scanpromos (auto anti-promo is on)',
-        '**Bump**: /bump_config /bump /bumpstatus',
-        '**Announce**: /announce /sayembed /invoice',
-        '**Help**: /help',
-      ].join('\n'));
+    // HELP
+    if (cmd === "help") {
+      const e = new EmbedBuilder()
+        .setColor(0x2dd4bf)
+        .setTitle("INVINCIBLE EATS — Commands")
+        .setDescription([
+          "**Tickets:** /claim /closeticket",
+          "**Payments:** /setpay /delpay /pay /showpay",
+          "**Orders:** /ueinspect",
+          "**Vouching:** /vouch /vouchcount",
+          "**Moderation:** /scanpromos",
+          "**Bump:** /bump_config /bump /bumpstatus",
+          "**Utility:** /announce /sayembed /invoice",
+          "**General:** /help"
+        ].join("\n"));
+
       return interaction.reply({ embeds: [e], ephemeral: true });
     }
 
-    // /scanpromos
-    if (interaction.commandName === 'scanpromos') {
-      const limit = interaction.options.getInteger('limit') || 200;
+    // SCANPROMOS
+    if (cmd === "scanpromos") {
+      const limit = interaction.options.getInteger("limit") || 200;
       await interaction.deferReply({ ephemeral: true });
-      const removed = await bulkScanPromos(interaction.channel, limit);
+
+      let removed = 0;
+      const msgs = await interaction.channel.messages.fetch({ limit: limit }).catch(() => null);
+
+      if (msgs) {
+        for (const [, m] of msgs) {
+          const embedText = m.embeds
+            ?.map(e => `${e.title || ""} ${e.description || ""}`)
+            .join(" ");
+          const combined = `${m.content || ""} ${embedText || ""}`;
+          if (PROMO_PATTERNS.some(r => r.test(combined))) {
+            await m.delete().catch(() => {});
+            removed++;
+          }
+        }
+      }
+
       return interaction.editReply(`Removed **${removed}** promotional messages.`);
     }
 
-    // /setpay  (Justice Chef or Manage Guild)
-    if (interaction.commandName === 'setpay') {
+    // SETPAY (flexible)
+    if (cmd === "setpay") {
       const member = interaction.member;
-      const hasManageGuild = member.permissions.has(PermissionFlagsBits.ManageGuild);
-      const hasJusticeChef = member.roles.cache.has(JUSTICE_CHEF_ROLE_ID);
+      const allowed =
+        member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+        member.roles.cache.has(JUSTICE_CHEF_ROLE_ID);
 
-      if (!hasManageGuild && !hasJusticeChef) {
+      if (!allowed) {
         return interaction.reply({
-          content: 'You must have the **Justice Chef on patrol** role or **Manage Server** permission to use `/setpay`.',
-          ephemeral: true,
+          content: "You must have **Justice Chef** or **Manage Server**.",
+          ephemeral: true
         });
       }
 
-      const staff = interaction.options.getUser('staff', true);
-      const info = { name: interaction.options.getString('name', true) };
-      for (const [, key] of PAYMENT_FIELDS.slice(1)) {
-        const v = interaction.options.getString(key); if (v) info[key] = v;
+      const user = interaction.options.getUser("staff", true);
+      const name = interaction.options.getString("name", true);
+      const methodsRaw = interaction.options.getString("methods", true);
+
+      const methods = {};
+      for (const lineRaw of methodsRaw.split(/\r?\n/)) {
+        const line = lineRaw.trim();
+        if (!line) continue;
+        const parts = line.split("=");
+        if (parts.length < 2) continue;
+        const methodName = parts[0].trim();
+        const value = parts.slice(1).join("=").trim();
+        if (!methodName || !value) continue;
+        methods[methodName] = value;
       }
-      payStore[staff.id] = info; writeJson('pay.json', payStore);
-      return interaction.reply({ content: `Saved payment fields for **${info.name}**.`, ephemeral: true });
-    }
 
-    // /delpay  (Justice Chef or Manage Guild)
-    if (interaction.commandName === 'delpay') {
-      const member = interaction.member;
-      const hasManageGuild = member.permissions.has(PermissionFlagsBits.ManageGuild);
-      const hasJusticeChef = member.roles.cache.has(JUSTICE_CHEF_ROLE_ID);
-
-      if (!hasManageGuild && !hasJusticeChef) {
+      if (!Object.keys(methods).length) {
         return interaction.reply({
-          content: 'You must have the **Justice Chef on patrol** role or **Manage Server** permission to use `/delpay`.',
-          ephemeral: true,
+          content: "No valid methods found. Use format: `Method = Value` (one per line).",
+          ephemeral: true
         });
       }
 
-      const staff = interaction.options.getUser('staff', true);
-      if (!payStore[staff.id]) {
-        return interaction.reply({
-          content: `No payment info is saved for **${staff.tag}**.`,
-          ephemeral: true,
-        });
-      }
+      payStore[user.id] = { name, methods };
+      writeJson("pay.json", payStore);
 
-      delete payStore[staff.id];
-      writeJson('pay.json', payStore);
       return interaction.reply({
-        content: `Deleted saved payment fields for **${staff.tag}**.`,
-        ephemeral: true,
+        content: `Saved payment methods for **${name}**.`,
+        ephemeral: true
       });
     }
 
-    // /pay
-    if (interaction.commandName === 'pay') {
-      const staff = interaction.options.getUser('staff', true);
-      const amount = interaction.options.getNumber('amount', true);
-      const note = interaction.options.getString('note') || '';
-      const info = payStore[staff.id] || { name: staff.tag };
-      const embed = buildPayEmbed(interaction.user, staff, info, amount, note);
-      const rows = buildPayButtons(info);
-      return interaction.reply({ content: `${staff}`, embeds: [embed], components: rows, ephemeral: false });
-    }
-
-    // /bump_config
-    if (interaction.commandName === 'bump_config') {
-      const interval = interaction.options.getInteger('interval') || 120;
-      bumpStore[interaction.guildId] = { channelId: interaction.channelId, intervalMin: interval, lastBumpTs: Date.now() };
-      writeJson('bumps.json', bumpStore); scheduleBumpTimer(interaction.guildId);
-      return interaction.reply({ content: `Bump reminders enabled here every **${interval}** minutes.`, ephemeral: true });
-    }
-
-    // /bump
-    if (interaction.commandName === 'bump') {
-      if (!bumpStore[interaction.guildId]) {
-        return interaction.reply({ content: 'Use **/bump_config** in a channel first to enable reminders.', ephemeral: true });
+    // DELPAY
+    if (cmd === "delpay") {
+      const user = interaction.options.getUser("staff", true);
+      if (!payStore[user.id]) {
+        return interaction.reply({
+          content: `No payment info found for **${user.tag}**.`,
+          ephemeral: true
+        });
       }
-      bumpStore[interaction.guildId].lastBumpTs = Date.now(); writeJson('bumps.json', bumpStore); scheduleBumpTimer(interaction.guildId);
-      return interaction.reply({ content: 'Got it! Timer reset from now.', ephemeral: true });
+
+      delete payStore[user.id];
+      writeJson("pay.json", payStore);
+
+      return interaction.reply({
+        content: `Deleted payment info for **${user.tag}**.`,
+        ephemeral: true
+      });
     }
 
-    // /bumpstatus
-    if (interaction.commandName === 'bumpstatus') {
+    // PAY (pings ticket opener)
+    if (cmd === "pay") {
+      const staff = interaction.options.getUser("staff", true);
+      const saved = payStore[staff.id];
+
+      if (!saved) {
+        return interaction.reply({ content: `No saved payment info for that staff member.`, ephemeral: true });
+      }
+
+      const amount = interaction.options.getNumber("amount");
+      const note = interaction.options.getString("note") || "";
+      const channel = interaction.channel;
+
+      let openerId = null;
+      if (channel && isTicketChannel(channel.name)) {
+        const messages = await fetchAllMessages(channel, 200);
+        openerId = await findOpener(channel, messages);
+      }
+
+      const embed = buildPayEmbed(interaction.user, staff, saved, amount ?? null, note, openerId);
+      const components = buildPayButtons(saved);
+
+      const payload = {
+        embeds: [embed],
+        components,
+        ephemeral: false
+      };
+
+      if (openerId) {
+        payload.content = `<@${openerId}>`;
+      }
+
+      return interaction.reply(payload);
+    }
+
+    // SHOWPAY
+    if (cmd === "showpay") {
+      const staff = interaction.options.getUser("staff", true);
+      const saved = payStore[staff.id];
+
+      if (!saved) {
+        return interaction.reply({
+          content: `No payment info saved for **${staff.tag}**.`,
+          ephemeral: true
+        });
+      }
+
+      const note = interaction.options.getString("note") || "";
+      const embed = buildPayEmbed(interaction.user, staff, saved, null, note, null);
+      const components = buildPayButtons(saved);
+
+      return interaction.reply({ embeds: [embed], components, ephemeral: false });
+    }
+
+    // BUMP CONFIG
+    if (cmd === "bump_config") {
+      const interval = interaction.options.getInteger("interval") || 120;
+
+      bumpStore[interaction.guildId] = {
+        intervalMin: interval,
+        channelId: interaction.channelId,
+        lastBumpTs: Date.now()
+      };
+
+      writeJson("bumps.json", bumpStore);
+      scheduleBumpTimer(interaction.guildId);
+
+      return interaction.reply({
+        content: `Bump reminders enabled every **${interval} minutes**.`,
+        ephemeral: true
+      });
+    }
+
+    // BUMP
+    if (cmd === "bump") {
+      if (!bumpStore[interaction.guildId]) {
+        return interaction.reply({ content: "Use **/bump_config** first.", ephemeral: true });
+      }
+
+      bumpStore[interaction.guildId].lastBumpTs = Date.now();
+      writeJson("bumps.json", bumpStore);
+      scheduleBumpTimer(interaction.guildId);
+
+      return interaction.reply({ content: "Timer reset!", ephemeral: true });
+    }
+
+    // BUMPSTATUS
+    if (cmd === "bumpstatus") {
       const cfg = bumpStore[interaction.guildId];
-      if (!cfg) return interaction.reply({ content: 'Bump reminder is not enabled. Use **/bump_config**.', ephemeral: true });
-      const ms = (cfg.intervalMin || 120) * 60 * 1000;
-      const next = (cfg.lastBumpTs || Date.now()) + ms;
-      const minsLeft = Math.max(0, Math.ceil((next - Date.now()) / 60000));
-      return interaction.reply({ content: `Next reminder in **${minsLeft}** min.`, ephemeral: true });
+      if (!cfg) {
+        return interaction.reply({ content: "Bump reminders are not enabled.", ephemeral: true });
+      }
+
+      const next = cfg.lastBumpTs + cfg.intervalMin * 60000;
+      const minsLeft = Math.ceil((next - Date.now()) / 60000);
+
+      return interaction.reply({
+        content: `Next reminder in **${minsLeft} minutes**.`,
+        ephemeral: true
+      });
     }
 
-    // /vouch
-    if (interaction.commandName === 'vouch') {
-      const staff = interaction.options.getUser('staff', true);
-      const text = interaction.options.getString('message', true);
-      const image = interaction.options.getAttachment('image');
-      const outChannel = interaction.options.getChannel('channel') || interaction.channel;
-      const embed = new EmbedBuilder().setColor(0xf59e0b).setTitle('✅ New Vouch').setDescription(text)
+    // VOUCH
+    if (cmd === "vouch") {
+      const staff = interaction.options.getUser("staff", true);
+      const messageText = interaction.options.getString("message", true);
+      const image = interaction.options.getAttachment("image");
+      const target = interaction.options.getChannel("channel") || interaction.channel;
+
+      const e = new EmbedBuilder()
+        .setColor(0xf59e0b)
+        .setTitle("✅ New Vouch")
+        .setDescription(messageText)
         .addFields(
-          { name: 'Customer', value: `${interaction.user}`, inline: true },
-          { name: 'Served by', value: `${staff}`, inline: true },
+          { name: "Customer", value: `${interaction.user}`, inline: true },
+          { name: "Served By", value: `${staff}`, inline: true }
         )
         .setTimestamp();
-      if (image) embed.setImage(image.url);
-      await outChannel.send({ embeds: [embed] });
+
+      if (image) e.setImage(image.url);
+
+      await target.send({ embeds: [e] });
+
+      // Update counts
       vouchByStaff[staff.id] = (vouchByStaff[staff.id] || 0) + 1;
       vouchByCust[interaction.user.id] = (vouchByCust[interaction.user.id] || 0) + 1;
-      writeJson('vouches_by_staff.json', vouchByStaff);
-      writeJson('vouches_by_customer.json', vouchByCust);
+
+      writeJson("vouches_by_staff.json", vouchByStaff);
+      writeJson("vouches_by_customer.json", vouchByCust);
+
+      // Apply customer tier roles (no downgrade of VILTRUMITE)
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (member) await applyCustomerRoles(interaction.guild, member, vouchByCust[interaction.user.id]);
-      return interaction.reply({ content: 'Thanks! Your vouch has been recorded.', ephemeral: true });
+      if (member) {
+        await applyCustomerRoles(interaction.guild, member, vouchByCust[interaction.user.id]);
+      }
+
+      return interaction.reply({ content: "Vouch recorded — thank you!", ephemeral: true });
     }
 
-    // /vouchcount
-    if (interaction.commandName === 'vouchcount') {
-      const user = interaction.options.getUser('user') || interaction.user;
+    // VOUCHCOUNT
+    if (cmd === "vouchcount") {
+      const user = interaction.options.getUser("user") || interaction.user;
       const count = vouchByCust[user.id] || 0;
       const tier = tierForCount(count);
-      const e = new EmbedBuilder().setColor(0x8b5cf6).setTitle('Customer Loyalty Status')
-        .setDescription([
-          `**User:** ${user}`,
-          `**Vouches (as customer):** ${count}`,
-          `**Tier:** ${tier ? tier.label : '—'}`,
-        ].join('\n'));
+
+      const e = new EmbedBuilder()
+        .setColor(0x8b5cf6)
+        .setTitle("Customer Loyalty Status")
+        .setDescription(
+          [
+            `**User:** ${user}`,
+            `**Vouches (as customer):** ${count}`,
+            `**Tier:** ${tier ? tier.label : "—"}`
+          ].join("\n")
+        );
+
       return interaction.reply({ embeds: [e], ephemeral: true });
     }
 
-    // /announce
-    if (interaction.commandName === 'announce') {
-      const title = interaction.options.getString('title', true);
-      const body = interaction.options.getString('body', true);
-      const ch = interaction.options.getChannel('channel') || interaction.channel;
-      const embed = new EmbedBuilder().setColor(0x3498db).setTitle(title).setDescription(body).setTimestamp();
-      await ch.send({ embeds: [embed] });
-      return interaction.reply({ content: 'Announcement posted.', ephemeral: true });
+    // ANNOUNCE
+    if (cmd === "announce") {
+      const title = interaction.options.getString("title", true);
+      const body = interaction.options.getString("body", true);
+      const channel = interaction.options.getChannel("channel") || interaction.channel;
+
+      const e = new EmbedBuilder()
+        .setColor(0x3498db)
+        .setTitle(title)
+        .setDescription(body)
+        .setTimestamp();
+
+      await channel.send({ embeds: [e] });
+      return interaction.reply({ content: "Announcement posted.", ephemeral: true });
     }
 
-    // /sayembed
-    if (interaction.commandName === 'sayembed') {
-      const text = interaction.options.getString('text', true);
-      const embed = new EmbedBuilder().setColor(0x1f2937).setDescription(text).setTimestamp();
+    // SAYEMBED
+    if (cmd === "sayembed") {
+      const text = interaction.options.getString("text", true);
+      const embed = new EmbedBuilder()
+        .setColor(0x1f2937)
+        .setDescription(text)
+        .setTimestamp();
+
       await interaction.channel.send({ embeds: [embed] });
-      return interaction.reply({ content: 'Sent.', ephemeral: true });
+      return interaction.reply({ content: "Sent!", ephemeral: true });
     }
 
-    // /invoice
-    if (interaction.commandName === 'invoice') {
-      const customer = interaction.options.getUser('customer', true);
-      const amount = interaction.options.getNumber('amount', true);
-      const items = interaction.options.getString('items', true);
-      const e = new EmbedBuilder().setColor(0x22c55e).setTitle('🧾 Invoice / Receipt')
+    // INVOICE
+    if (cmd === "invoice") {
+      const customer = interaction.options.getUser("customer", true);
+      const amount = interaction.options.getNumber("amount", true);
+      const items = interaction.options.getString("items", true);
+
+      const e = new EmbedBuilder()
+        .setColor(0x22c55e)
+        .setTitle("🧾 Invoice / Receipt")
         .addFields(
-          { name: 'Customer', value: `${customer}`, inline: true },
-          { name: 'Amount', value: fmtMoney(amount), inline: true },
+          { name: "Customer", value: `${customer}`, inline: true },
+          { name: "Amount", value: fmtMoney(amount), inline: true }
         )
         .setDescription(items)
         .setFooter({ text: `Generated by ${interaction.user.tag}` })
         .setTimestamp();
+
       await interaction.channel.send({ embeds: [e] });
-      return interaction.reply({ content: 'Invoice posted.', ephemeral: true });
+
+      return interaction.reply({ content: "Invoice posted.", ephemeral: true });
     }
 
-    // /ueinspect
-    if (interaction.commandName === 'ueinspect') {
-      const url = interaction.options.getString('url', true);
-      const m = url.match(UE_REGEX);
-      if (!m) return interaction.reply({ content: 'Please provide a valid **Uber Eats group** URL.', ephemeral: true });
-      const forwarded = await forwardUE(m[0], interaction.user);
-      if (forwarded) return interaction.reply({ content: 'Forwarded to the tickets channel. 👍', ephemeral: true });
-      return interaction.reply({ content: 'Could not forward to the tickets channel. Check the channel ID.', ephemeral: true });
-    }
+    // UEINSPECT
+    if (cmd === "ueinspect") {
+      const url = interaction.options.getString("url", true);
+      const match = url.match(UE_REGEX);
 
-    // /closeticket — show panel
-    if (interaction.commandName === 'closeticket') {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
-        return interaction.reply({ content: 'You need **Manage Channels** permission.', ephemeral: true });
+      if (!match) {
+        return interaction.reply({
+          content: "Please provide a valid **Uber Eats group link**.",
+          ephemeral: true
+        });
       }
-      const e = new EmbedBuilder()
+
+      const ch = client.channels.cache.get(UBER_TICKETS_CHANNEL);
+      if (!ch) {
+        return interaction.reply({ content: "Configured tickets channel missing.", ephemeral: true });
+      }
+
+      await ch.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3b82f6)
+            .setTitle("🍔 New Uber Eats Group Order")
+            .setDescription(`Forwarded by ${interaction.user}\n\n${match[0]}`)
+            .setTimestamp()
+        ]
+      });
+
+      return interaction.reply({ content: "Forwarded to the tickets channel!", ephemeral: true });
+    }
+
+    // CLOSETICKET
+    if (cmd === "closeticket") {
+      const can = interaction.member.permissions.has(PermissionFlagsBits.ManageChannels);
+      if (!can) {
+        return interaction.reply({ content: "You need **Manage Channels**.", ephemeral: true });
+      }
+
+      const embed = new EmbedBuilder()
         .setColor(0xf59e0b)
-        .setTitle('Close Ticket')
+        .setTitle("Close Ticket")
         .setDescription(
-          'Choose an option:\n' +
-          '**Save & Close** — generate transcript, DM opener, log & delete.\n' +
-          '**Delete Only** — delete this channel without saving.'
+          "**Save & Close** — Generate transcript, DM user, log, delete.\n" +
+          "**Delete Only** — Delete ticket WITHOUT saving."
         );
+
       const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('ticket:save_close').setStyle(ButtonStyle.Success).setEmoji('💾').setLabel('Save & Close'),
-        new ButtonBuilder().setCustomId('ticket:delete_only').setStyle(ButtonStyle.Danger).setEmoji('🗑️').setLabel('Delete Only'),
+        new ButtonBuilder()
+          .setCustomId("ticket:save_close")
+          .setStyle(ButtonStyle.Success)
+          .setEmoji("💾")
+          .setLabel("Save & Close"),
+
+        new ButtonBuilder()
+          .setCustomId("ticket:delete_only")
+          .setStyle(ButtonStyle.Danger)
+          .setEmoji("🗑️")
+          .setLabel("Delete Only")
       );
-      return interaction.reply({ embeds: [e], components: [row], ephemeral: true });
+
+      return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+    }
+
+    // CLAIM
+    if (cmd === "claim") {
+      const member = interaction.member;
+      const allowed =
+        member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+        member.roles.cache.has(JUSTICE_CHEF_ROLE_ID);
+
+      if (!allowed) {
+        return interaction.reply({
+          content: "You need **Manage Channels** or **Justice Chef on patrol**.",
+          ephemeral: true
+        });
+      }
+
+      const channel = interaction.channel;
+      if (!channel || !isTicketChannel(channel.name)) {
+        return interaction.reply({
+          content: "This command can only be used in a ticket channel.",
+          ephemeral: true
+        });
+      }
+
+      const targetUser = interaction.options.getUser("user", true);
+      const ticketNumber = extractTicketNumberFromChannel(channel.name) || "0000";
+
+      const original = `ticket-${ticketNumber}`;
+      const userSlug = slugifyUsername(targetUser.username);
+      const newName = `${userSlug}-invincible-${ticketNumber}`;
+
+      const newTopic =
+        channel.topic && channel.topic.toLowerCase().includes("original:")
+          ? channel.topic
+          : `Original: ${original}${channel.topic ? ` | ${channel.topic}` : ""}`;
+
+      try {
+        await channel.edit({ name: newName, topic: newTopic });
+      } catch (e) {
+        return interaction.reply({
+          content: "Rename failed — check channel permissions.",
+          ephemeral: true
+        });
+      }
+
+      const e = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle("🎫 Ticket Claimed")
+        .setDescription(
+          `Ticket assigned to **${targetUser}**.\n\n` +
+          `**New Name:** \`${newName}\`\n` +
+          `**Original:** \`${original}\``
+        )
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [e], ephemeral: true });
     }
 
   } catch (err) {
-    console.error('Interaction error', err);
-    if (!interaction.replied) {
-      await interaction.reply({ content: 'Something went wrong.', ephemeral: true }).catch(() => { });
+    console.error("Interaction Error:", err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: "Something went wrong.", ephemeral: true });
     }
   }
 });
 
-// ============ Register & login ============
+// ============================================
+// EXPRESS HOSTING
+// ============================================
+
+app.use("/transcripts", express.static(TRANSCRIPT_DIR));
+app.use("/attachments", express.static(ATTACH_DIR));
+
+app.get("/", (req, res) => {
+  res.send("INVINCIBLE EATS — Transcript Host Active");
+});
+
+app.listen(PORT, () => console.log(`🌐 Transcript host running on port ${PORT}`));
+
+// ============================================
+// READY + LOGIN
+// ============================================
+
+client.once("ready", () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  // Start bump timers
+  for (const guildId of Object.keys(bumpStore)) {
+    scheduleBumpTimer(guildId);
+  }
+
+  // Start watchdog
+  startStatusWatchdog(client);
+
+  console.log("🛡 Status Guard enabled.");
+});
+
 (async () => {
   if (!process.env.DISCORD_TOKEN || !process.env.CLIENT_ID) {
-    console.log('⚠️ Set DISCORD_TOKEN and CLIENT_ID in your environment.');
+    console.log("⚠️ Missing environment variables — DISCORD_TOKEN or CLIENT_ID.");
+    return;
   }
-  try { await registerCommands(); }
-  catch (e) { console.error('Command registration failed:', e.message || e); }
+
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.log("Command registration failed:", err.message);
+  }
+
   client.login(process.env.DISCORD_TOKEN);
 })();
