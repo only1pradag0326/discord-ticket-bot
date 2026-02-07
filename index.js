@@ -20,10 +20,19 @@ const {
   EmbedBuilder,
   ButtonBuilder,
   ActionRowBuilder,
+  ChannelSelectMenuBuilder,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ButtonStyle,
   AttachmentBuilder,
   ChannelType,
 } = require("discord.js");
+
+// NOTE: We intentionally do NOT use cookies/auth for DoorDash/Uber Eats.
+// The "tracker" feature below is best-effort link parsing + preview only.
+// Live driver/order status typically requires the user's authenticated session and/or private APIs.
 
 // ============================================
 // EXPRESS HOST (for transcripts + attachments)
@@ -88,19 +97,107 @@ const STAFF_ROLE_IDS = [
 const DATA_DIR = path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+
+function resolveDataPath(file) {
+  // Some callers pass absolute paths (e.g., probing legacy locations).
+  // Avoid path.join(DATA_DIR, absPath) which would create an invalid nested path.
+  return path.isAbsolute(file) ? file : path.join(DATA_DIR, file);
+}
+
 function readJson(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), "utf8"));
+    return JSON.parse(fs.readFileSync(resolveDataPath(file), "utf8"));
   } catch {
     return fallback;
   }
 }
 
 function writeJson(file, data) {
-  fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
+  fs.writeFileSync(resolveDataPath(file), JSON.stringify(data, null, 2));
 }
 
 const payStore = readJson("pay.json", {});                // staffId -> { name, methods: { MethodName: value } }
+// Supported payment method labels (also used for validation + display ordering)
+const PAY_METHODS_ORDER = [
+  "Cash App",
+  "Venmo",
+  "Apple Pay",
+  "Zelle",
+  "Chime",
+  "Stripe",
+  "PayPal",
+  "Crypto"
+];
+function canonicalizePaymentMethodName(raw) {
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+
+  // Normalize to compare against known methods (letters/numbers only)
+  const normalized = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+  const aliasMap = {
+    cashapp: "Cash App",
+    cash: "Cash App",
+    venmo: "Venmo",
+    applepay: "Apple Pay",
+    apple: "Apple Pay",
+    zelle: "Zelle",
+    paypal: "PayPal",
+    pp: "PayPal",
+    crypto: "Crypto",
+    coinbase: "Crypto",
+    chime: "Chime",
+    stripe: "Stripe",
+  };
+
+  if (aliasMap[normalized]) return aliasMap[normalized];
+
+  // If the user typed an exact known method with different casing/spaces, keep canonical casing
+  const known = PAY_METHODS_ORDER.find((m) => m.toLowerCase().replace(/[^a-z0-9]+/g, "") === normalized);
+  if (known) return known;
+
+  // Otherwise allow any custom method name; title-case it for a cleaner display.
+  const titleCased = trimmed
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+
+  // Hard limit so embeds/UI don't get wrecked
+  return titleCased.slice(0, 40);
+}
+
+function buildEditPayPanel({ guild, staffId }) {
+  const entry = payStore[staffId] || { name: null, methods: {} };
+  const staffMember = guild?.members?.cache?.get(staffId) || null;
+  const staffName = entry.name || staffMember?.displayName || `User ${staffId}`;
+
+  // Keep a stable ordering (common methods first, then any custom ones)
+  const methods = entry.methods || {};
+  const orderedKeys = [
+    ...PAY_METHODS_ORDER.filter(k => methods[k]),
+    ...Object.keys(methods).filter(k => !PAY_METHODS_ORDER.includes(k)).sort((a, b) => a.localeCompare(b))
+  ];
+
+  const lines = orderedKeys.length
+    ? orderedKeys.map(k => `• **${k}**: ${methods[k]}`).join("\n")
+    : "*(No payment methods saved yet.)*";
+
+  const embed = new EmbedBuilder()
+    .setTitle("Edit payment methods")
+    .setDescription(`**Staff:** ${staffName}\n\n${lines}`)
+    .setFooter({ text: "Use the buttons below to add/update or delete methods." });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`payedit:add:${staffId}`).setLabel("Add / Update").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`payedit:del:${staffId}`).setLabel("Delete").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`payedit:clear:${staffId}`).setLabel("Clear all").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`payedit:done:${staffId}`).setLabel("Done").setStyle(ButtonStyle.Success)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
 const bumpStore = readJson("bumps.json", {});             // guildId -> { channelId, intervalMin, lastBumpTs, pingRoleId?, pingUserId? }
 const ticketCfgStore = readJson("ticket_config.json", {}); // guildId -> { ticketCategoryId?, ticketNamePrefix?, ticketLogChannelId? }
 
@@ -118,9 +215,55 @@ const vouchByCust = readJson("vouches_by_customer.json", {}); // customerId -> c
 // Global host config (lets you set the public URL used for transcript links)
 const hostCfg = readJson("host_config.json", { publicBaseUrl: "" });
 
-// ============================================
-// DIRECTORIES
-// ============================================
+// =========================
+// DNF (Does Not Finish) CONFIG
+// =========================
+// Keep a single, stable on-disk location for DNF config so upgrades don't silently break.
+// (Some earlier revisions accidentally read from an undefined variable, which made
+// /dnf_setup look like it "did nothing".)
+const DNF_CFG_FILE = "dnf_config.json";
+
+// guildId -> { roleId, panelChannelIds: [] }
+let dnfCfgStore = readJson(DNF_CFG_FILE, {});
+
+// Best-effort migration for older filenames (no-op if not present)
+// This keeps existing /dnf_setup data working after code updates.
+try {
+  if (!dnfCfgStore || Object.keys(dnfCfgStore).length === 0) {
+    const legacyPaths = [
+      // Common "root" locations
+      path.join(process.cwd(), "dnf_config.json"),
+      path.join(process.cwd(), "dnf.json"),
+      path.join(process.cwd(), "dnfConfig.json"),
+      path.join(process.cwd(), "dnf_cfg.json"),
+
+      // Fallback to the folder where this script lives
+      path.join(__dirname, "dnf_config.json"),
+      path.join(__dirname, "dnf.json"),
+      path.join(__dirname, "dnfConfig.json"),
+      path.join(__dirname, "dnf_cfg.json"),
+    ];
+
+    for (const legacyPath of legacyPaths) {
+      if (!fs.existsSync(legacyPath)) continue;
+      try {
+        const raw = fs.readFileSync(legacyPath, "utf8");
+        const legacy = raw ? JSON.parse(raw) : null;
+        if (legacy && typeof legacy === "object" && Object.keys(legacy).length) {
+          dnfCfgStore = legacy;
+          writeJson(DNF_CFG_FILE, dnfCfgStore);
+          break;
+        }
+      } catch (_e) {
+        // ignore a bad legacy file and keep trying
+      }
+    }
+  }
+} catch (e) {
+  // ignore migration errors; bot will continue with empty config
+}
+
+
 
 const TRANSCRIPT_DIR = path.join(__dirname, "transcripts");
 const ATTACH_DIR = path.join(__dirname, "attachments");
@@ -182,6 +325,9 @@ const client = new Client({
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 const fmtMoney = n =>
   new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n ?? 0);
+const fmtMoneyCAD = n =>
+  new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(n ?? 0);
+
 
 function isLikelyVouchChannel(channel) {
   try {
@@ -206,7 +352,10 @@ function extractTicketNumberFromChannel(name = "") {
 }
 
 function isTicketChannel(name = "") {
-  return /^ticket-\d+$/i.test(name) || /-invincible-\d+$/i.test(name);
+  // TicketTool default: ticket-####
+  // Claimed names: <user>-<serverOrCategory>-####
+  const n = String(name || "");
+  return /^ticket-\d+$/i.test(n) || /-\d{3,}$/i.test(n);
 }
 
 // Simple anti-promo patterns
@@ -267,30 +416,220 @@ function getBestFeeDiscountForMember(member) {
 const DOORDASH_REGEX = /(?:https?:\/\/)?(?:www\.)?doordash\.com\/[^\s]+/i;
 const DOORDASH_SHORT_REGEX = /(?:https?:\/\/)?(?:www\.)?drd\.sh\/[^\s]+/i;
 
+// More specific DoorDash link types (best-effort parsing)
+// NOTE: These pages are often client-rendered, so this is mainly for extracting IDs.
+const DOORDASH_GIFT_REGEX = /https?:\/\/(?:www\.)?doordash\.com\/gifts\/([0-9a-f-]{32,36})(?:\?[^\s]*)?/i;
+// Some users share DoorDash order links; this captures an order-ish identifier if present.
+// Examples we try to recognize:
+// - https://www.doordash.com/orders/<id>/...
+// - https://www.doordash.com/order/<id>/...
+const DOORDASH_ORDER_TRACK_REGEX = /https?:\/\/(?:www\.)?doordash\.com\/(?:orders|order)\/([^\s/?#]+)(?:[^\s]*)?/i;
+
 const ORDER_LINK_ALLOWLIST = [UE_REGEX,
   UE_SHORT_REGEX, DOORDASH_REGEX, DOORDASH_SHORT_REGEX];
 
 // ========================
 // AUTO-BAN LINK SPAM (NON-STAFF)
 // ========================
-// Enabled by default. Set BAN_LINKS_ENABLED=false to disable.
-const BAN_LINKS_ENABLED = String(process.env.BAN_LINKS_ENABLED ?? "true").toLowerCase() === "true";
+// ✅ Default behavior: ONLY ban Discord invite links.
+// This prevents customers getting banned for normal restaurant sites.
+//
+// Optional:
+// - Set BAN_ALL_LINKS=true if you *really* want to ban every other URL too.
+// - Legacy env BAN_LINKS_ENABLED is still supported and maps to BAN_ALL_LINKS.
+const BAN_INVITES_ENABLED = String(process.env.BAN_INVITES_ENABLED ?? "true").toLowerCase() === "true";
+const BAN_ALL_LINKS = String(process.env.BAN_ALL_LINKS ?? (process.env.BAN_LINKS_ENABLED ?? "false")).toLowerCase() === "true";
 
 // Ban reason shown in the server audit log.
-const BAN_LINK_REASON =
-  process.env.BAN_LINK_REASON ||
-  "Automatic moderation: posted a prohibited link (anti-spam).";
+const BAN_REASON_PREFIX = process.env.BAN_REASON_PREFIX || "Link spam / advertising";
 
-// Detect Discord invites even without protocol.
-const DISCORD_INVITE_REGEX =
-  /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/[^\s]+/i;
+// Optional: where to post an announcement when someone is banned.
+// Leave blank to disable announcements.
+const BAN_ANNOUNCE_CHANNEL_ID = process.env.BAN_ANNOUNCE_CHANNEL_ID || "1386924127222497350";
 
-// Detect any http/https URL.
+// Which links should NEVER trigger bans (order links + common restaurant platforms)
+const RESTAURANT_URL_ALLOWLIST = [
+  // Food platforms
+  /https?:\/\/(www\.)?(eats\.uber\.com|ubereats\.com)\//i,
+  /https?:\/\/(www\.)?(doordash\.com)\//i,
+  /(?:https?:\/\/)?(?:www\.)?drd\.sh\//i,
+  /https?:\/\/(www\.)?(grubhub\.com|postmates\.com|chownow\.com|toasttab\.com)\//i,
+  /https?:\/\/(www\.)?(square\.site|squareup\.com|clover\.com|menufy\.com)\//i,
+
+  // Reviews / maps (often used to share restaurant pages)
+  /https?:\/\/(www\.)?yelp\.com\//i,
+  /https?:\/\/(www\.)?google\.com\/maps\//i,
+  /https?:\/\/maps\.app\.goo\.gl\//i
+];
+
+function isAllowedLink(text = "") {
+  const combined = String(text || "");
+  return (
+    ORDER_LINK_ALLOWLIST.some(r => r.test(combined)) ||
+    RESTAURANT_URL_ALLOWLIST.some(r => r.test(combined))
+  );
+}
+
+// Discord invite links (discord.gg / discord.com/invite)
+const DISCORD_INVITE_REGEX = /(https?:\/\/)?(www\.)?(discord\.gg|discord\.com\/invite)\/[\w-]+/i;
+
+// Any normal URL (used only if BAN_ALL_LINKS=true)
 const ANY_HTTP_URL_REGEX = /https?:\/\/[^\s]+/i;
 
 function firstLinkSnippet(text = "") {
-  const m = text.match(DISCORD_INVITE_REGEX) || text.match(ANY_HTTP_URL_REGEX);
+  const t = String(text || "");
+  const m = t.match(DISCORD_INVITE_REGEX) || t.match(ANY_HTTP_URL_REGEX);
   return m ? m[0].slice(0, 180) : "";
+}
+
+// ============================================
+// ORDER LINK TRACKER (best-effort link preview)
+// ============================================
+
+function extractFirstHttpUrl(text = "") {
+  const t = String(text || "");
+  const m = t.match(/https?:\/\/[^\s<>()]+/i);
+  return m ? m[0] : "";
+}
+
+function classifyOrderLink(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+
+  const host = (u.hostname || "").toLowerCase().replace(/^www\./, "");
+  const path = (u.pathname || "").replace(/\/+$/, "");
+
+  // DoorDash
+  if (host.endsWith("doordash.com") || host === "drd.sh") {
+    const gift = url.match(DOORDASH_GIFT_REGEX);
+    if (gift) {
+      return { provider: "DoorDash", type: "Gift link", id: gift[1] };
+    }
+    const ord = url.match(DOORDASH_ORDER_TRACK_REGEX);
+    if (ord) {
+      return { provider: "DoorDash", type: "Order link", id: ord[1] };
+    }
+    if (host === "drd.sh") {
+      return { provider: "DoorDash", type: "Short link", id: "" };
+    }
+    return { provider: "DoorDash", type: "Link", id: "" };
+  }
+
+  // Uber Eats
+  if (host.endsWith("ubereats.com") || host.endsWith("eats.uber.com")) {
+    // Common: /orders/<id>
+    const m = path.match(/^\/orders\/(.+)$/i);
+    if (m) {
+      return { provider: "Uber Eats", type: "Order link", id: m[1].split("/")[0] };
+    }
+    // Group orders / promo / etc.
+    return { provider: "Uber Eats", type: "Link", id: "" };
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Backwards-compatible helper aliases
+// ---------------------------------------------------------------------------
+// Some handlers in this file were written with these older function names.
+// Keep them as thin wrappers so the bot continues to run.
+function classifyTrackingUrl(url) {
+  return classifyOrderLink(url);
+}
+
+async function fetchOpenGraphMeta(url) {
+  // Many DoorDash/Uber Eats pages are JS-rendered and won't expose useful HTML.
+  // Still, we try to grab basic <title> and OG tags if available.
+  try {
+    const res = await axios.get(url, {
+      timeout: 6000,
+      maxRedirects: 4,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; DiscordBot/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+      },
+      validateStatus: s => s >= 200 && s < 500,
+    });
+    const html = String(res.data || "");
+    const pick = (re) => {
+      const m = html.match(re);
+      return m ? String(m[1] || "").trim() : "";
+    };
+    const title = pick(/<title[^>]*>([^<]{1,120})<\/title>/i);
+    const ogTitle = pick(/property=["']og:title["'][^>]*content=["']([^"']{1,140})["']/i) ||
+      pick(/content=["']([^"']{1,140})["'][^>]*property=["']og:title["']/i);
+    const ogDesc = pick(/property=["']og:description["'][^>]*content=["']([^"']{1,200})["']/i) ||
+      pick(/content=["']([^"']{1,200})["'][^>]*property=["']og:description["']/i);
+    const ogImage = pick(/property=["']og:image["'][^>]*content=["']([^"']{1,300})["']/i) ||
+      pick(/content=["']([^"']{1,300})["'][^>]*property=["']og:image["']/i);
+    return { title: ogTitle || title, description: ogDesc, image: ogImage };
+  } catch {
+    return { title: "", description: "", image: "" };
+  }
+}
+
+// Older name used in some handlers
+const fetchOGMeta = fetchOpenGraphMeta;
+
+// Older embed helper used by the /track-order flow.
+// Newer code uses buildOrderLinkEmbed(url) which fetches OG data internally.
+function buildTrackingEmbed(url, info, og = {}, requestedBy) {
+  const embed = new EmbedBuilder()
+    .setTitle(og?.title ? `Order Link Preview: ${String(og.title).slice(0, 240)}` : "Order Link Preview")
+    .setDescription(
+      "I can show basic details from the link (provider/type/id). " +
+        "Live order progress/driver location usually requires you to be logged into DoorDash/Uber Eats, " +
+        "so I can’t reliably display that without an official API."
+    )
+    .addFields(
+      { name: "Provider", value: info?.provider || "Unknown", inline: true },
+      { name: "Type", value: info?.type || "Link", inline: true },
+      { name: "ID", value: info?.id ? `\`${String(info.id).slice(0, 80)}\`` : "—", inline: true },
+      { name: "Link", value: url.length > 1000 ? url.slice(0, 1000) + "…" : url }
+    )
+    .setTimestamp(Date.now());
+
+  if (requestedBy) {
+    embed.setFooter({ text: `Requested by ${requestedBy.tag || requestedBy.username || ""}`.trim() });
+    const av = safeAvatarUrl(requestedBy);
+    if (av) embed.setFooter({ text: `Requested by ${requestedBy.tag || requestedBy.username || ""}`.trim(), iconURL: av });
+  }
+
+  if (og?.description) embed.addFields({ name: "Preview", value: String(og.description).slice(0, 1024) });
+  if (og?.image && /^https?:\/\//i.test(og.image)) embed.setThumbnail(og.image);
+  return embed;
+}
+
+async function buildOrderLinkEmbed(url) {
+  const info = classifyOrderLink(url);
+  const og = await fetchOpenGraphMeta(url);
+
+  const embed = new EmbedBuilder()
+    .setTitle(og.title ? `Order Link Preview: ${og.title}`.slice(0, 256) : "Order Link Preview")
+    .setDescription(
+      "I can show basic details from the link (provider/type/id). " +
+        "Live order progress/driver location usually requires you to be logged into DoorDash/Uber Eats, " +
+        "so I can’t reliably display that without an official API."
+    )
+    .addFields(
+      { name: "Provider", value: info?.provider || "Unknown", inline: true },
+      { name: "Type", value: info?.type || "Link", inline: true },
+      { name: "ID", value: info?.id ? `\`${String(info.id).slice(0, 80)}\`` : "—", inline: true },
+      { name: "Link", value: url.length > 1000 ? url.slice(0, 1000) + "…" : url }
+    )
+    .setTimestamp(Date.now());
+
+  if (og.description) embed.addFields({ name: "Preview", value: og.description.slice(0, 1024) });
+  if (og.image && /^https?:\/\//i.test(og.image)) embed.setThumbnail(og.image);
+
+  const openBtn = new ButtonBuilder().setLabel("Open link").setStyle(ButtonStyle.Link).setURL(url);
+  const row = new ActionRowBuilder().addComponents(openBtn);
+  return { embed, row };
 }
 
 
@@ -629,7 +968,8 @@ async function forceCloseServer(guild, reason = "auto", opts = {}) {
     alreadyClosed: false,
     status: { ok: false, error: null },
     order: { ok: false, error: null, before: null, after: null },
-    everyone: { ok: false, error: null }
+    everyone: { ok: false, error: null },
+    patrol: { ok: false, removed: 0, error: null }
   };
 
   try {
@@ -1127,8 +1467,14 @@ function scheduleBumpTimer(guildId) {
       const row = buildBumpButtonsRow();
       const mention = getDisboardCommandMention(guildId);
 
+      // Mobile-friendly copy UI: Discord shows a one-tap "Copy" button for code blocks.
+      // This mirrors the "tap-to-copy" feel users often expect.
+      const bumpCopyBlock = "`/bump`";
+
       await ch.send({
-        content: mention ? `${ping}\nTap to run: ${mention}` : ping,
+        content: mention
+          ? `${ping}\nTap to run: ${mention}\n${bumpCopyBlock}`
+          : `${ping}\n${bumpCopyBlock}`,
         embeds: [embed],
         components: row ? [row] : []
       });
@@ -1168,9 +1514,9 @@ async function tryAutoVouchFromMessage(msg) {
     // - message contains an attachment (common: screenshot) with a staff mention
     const text = String(msg.content || "").toLowerCase();
     const hasVouchWord =
-      /vouch(ed|ing)?/i.test(text) ||
-      /\+1/.test(text) ||
-      /rep/i.test(text);
+      /\bvouch(ed|ing)?\b/i.test(text) ||
+      /\b\+1\b/.test(text) ||
+      /\brep\b/i.test(text);
 
     const hasAttachment = (msg.attachments?.size || 0) > 0;
 
@@ -1187,7 +1533,7 @@ async function tryAutoVouchFromMessage(msg) {
     // Sync loyalty tier roles
     const customerMember = await msg.guild.members.fetch(msg.author.id).catch(() => null);
     if (customerMember) {
-      await syncCustomerTierRoles(msg.guild, customerMember, newCustCount);
+      await syncCustomerTierRolesUpgradeOnly(msg.guild, customerMember, newCustCount);
     }
 
     // Lightweight confirmation
@@ -1231,11 +1577,12 @@ client.on("messageCreate", async msg => {
     console.log("Auto-bump error:", err);
   }
 
-  // 2) Auto-ban link spam (Discord invites or any http/https link) — non-staff only
+  // 2) Auto-ban link spam (invite-only by default)
+  // - Always bans Discord invites (unless you disable BAN_INVITES_ENABLED)
+  // - Optionally bans ALL other links if BAN_ALL_LINKS=true (but still allows restaurant/order links)
   try {
-    if (BAN_LINKS_ENABLED && !msg.author.bot) {
+    if (!msg.author.bot) {
       const member = msg.member;
-
       const isStaff = member?.roles?.cache?.some(r => STAFF_ROLE_IDS.includes(r.id));
       if (!isStaff) {
         const embedText = msg.embeds
@@ -1244,51 +1591,50 @@ client.on("messageCreate", async msg => {
 
         const combined = `${msg.content || ""} ${embedText || ""}`;
 
-        // Keep order links allowed (UE / DoorDash), so customers can still place orders.
-        const allowedOrderLink = ORDER_LINK_ALLOWLIST.some(r => r.test(combined));
-        if (!allowedOrderLink) {
-          const hasDiscordInvite = DISCORD_INVITE_REGEX.test(combined);
-          const hasAnyUrl = ANY_HTTP_URL_REGEX.test(combined);
+        const hasDiscordInvite = DISCORD_INVITE_REGEX.test(combined);
+        const hasAnyUrl = ANY_HTTP_URL_REGEX.test(combined);
+        const allowedLink = isAllowedLink(combined); // UberEats/DoorDash + common restaurant platforms
 
-          if (hasDiscordInvite || hasAnyUrl) {
-            const link = firstLinkSnippet(combined);
-            const reason = `${BAN_LINK_REASON}${link ? ` | Link: ${link}` : ""}`;
+        const shouldBanInvite = BAN_INVITES_ENABLED && hasDiscordInvite;
+        const shouldBanAllLinks = BAN_ALL_LINKS && hasAnyUrl && !allowedLink;
 
-            // Remove the spam message first (best-effort)
-            await msg.delete().catch(() => {});
+        if (shouldBanInvite || shouldBanAllLinks) {
+          const snippet = firstLinkSnippet(combined) || "(link)";
+          // Use BAN_REASON_PREFIX as the canonical reason text
+          const reason = shouldBanInvite
+            ? `${BAN_REASON_PREFIX} | Discord invite: ${snippet}`
+            : `${BAN_REASON_PREFIX} | Link: ${snippet}`;
 
-            // Ban the user (best-effort)
-            const target = member || (await msg.guild.members.fetch(msg.author.id).catch(() => null));
-            if (target?.bannable) {
-              await target.ban({ reason }).catch(() => {});
-            } else {
-              console.log(`[AUTO-BAN] Could not ban ${msg.author.tag} (missing permissions / not bannable).`);
-            }
+          console.log(`[AUTO-BAN] Banning ${msg.author.tag} for ${shouldBanInvite ? 'invite' : 'link'}: ${snippet}`);
 
-            // Log to the configured auto-ban announcements channel
-            const ann = client.channels.cache.get(AUTO_BAN_ANNOUNCE_CHANNEL_ID);
-            if (ann) {
-              const e = new EmbedBuilder()
-                .setColor(0xef4444)
-                .setTitle("🔨 Auto-Ban — Link Spam")
-                .setDescription(
-                  `User ${msg.author} was banned for posting a prohibited link.\n\n` +
-                  (link ? `**Link:** ${link}\n` : "") +
-                  `**Channel:** <#${msg.channelId}>`
-                )
-                .setTimestamp();
-              ann.send({ embeds: [e] }).catch(() => {});
-            }
-
-            // Optional DM (ignore failures)
-            try {
-              await msg.author.send(
-                `You were banned from **${msg.guild.name}** for posting a prohibited link.\nReason: ${BAN_LINK_REASON}`
-              );
-            } catch {}
-
-            return; // stop further handling
+          // Announce (best-effort)
+          const ann = client.channels.cache.get(BAN_ANNOUNCE_CHANNEL_ID);
+          if (ann && ann.isTextBased()) {
+            const e = new EmbedBuilder()
+              .setColor(0xef4444)
+              .setTitle("🚫 Auto-Ban")
+              .setDescription(`**User:** ${msg.author} (\`${msg.author.tag}\`)
+**Channel:** <#${msg.channelId}>
+**Reason:** ${escapeHTML(reason)}`)
+              .setTimestamp();
+            ann.send({ embeds: [e] }).catch(() => {});
           }
+
+          // Delete message (best-effort)
+          await msg.delete().catch(() => {});
+
+          // Ban user
+          await msg.guild.members.ban(msg.author.id, { reason }).catch(() => {});
+
+          // DM user
+          try {
+            await msg.author.send(
+              `You were banned from **${msg.guild.name}** for posting a prohibited link.
+Reason: ${reason}`
+            );
+          } catch {}
+
+          return; // stop further handling
         }
       }
     }
@@ -1309,15 +1655,15 @@ client.on("messageCreate", async msg => {
 
         const combined = `${msg.content || ""} ${embedText || ""}`;
 
-        // ✅ Allowlist legit order links so customers can post them safely.
-        const allowedOrderLink = ORDER_LINK_ALLOWLIST.some(r => r.test(combined));
-        if (allowedOrderLink) {
-          console.log(`[ANTI-PROMO] Allowed order link from ${msg.author.tag} in #${msg.channel?.name || msg.channelId}`);
-          return;
-        }
+      // ✅ Allowlist legit order links so customers can post them safely.
+      // NOTE: Don't `return` here; we still want other handlers (like the tracker) to run.
+      const allowedOrderLink = ORDER_LINK_ALLOWLIST.some(r => r.test(combined));
+      if (allowedOrderLink) {
+        console.log(`[ANTI-PROMO] Allowed order link from ${msg.author.tag} in #${msg.channel?.name || msg.channelId}`);
+      }
 
         // Match against promo patterns (no blanket /https?:\/\// pattern is used)
-        const hit = PROMO_PATTERNS.find(r => r.test(combined));
+      const hit = !allowedOrderLink ? PROMO_PATTERNS.find(r => r.test(combined)) : null;
         if (hit) {
           console.log(`[ANTI-PROMO] Deleted message from ${msg.author.tag} (matched: ${hit})`);
           await msg.delete().catch(err => console.log("Delete failed:", err.message));
@@ -1327,7 +1673,33 @@ client.on("messageCreate", async msg => {
   } catch (err) {
     console.log("Anti-promo error:", err);
   }
-// 4) Status guard
+
+  // 4) Auto-preview DoorDash / Uber Eats links (best-effort)
+  // This does NOT fetch private tracking info (no cookies/auth). It only builds an embed
+  // with parsed IDs and any publicly available OpenGraph metadata.
+  try {
+    if (!msg.author.bot) {
+      const combined = `${msg.content || ""} ${msg.embeds?.map(e => `${e.title || ""} ${e.description || ""} ${e.url || ""}`).join(" ") || ""}`;
+      const url = extractFirstHttpUrl(combined);
+      if (url) {
+        const info = classifyTrackingUrl(url);
+        if (info.provider !== "Unknown") {
+          const og = await fetchOGMeta(url);
+          const embed = buildTrackingEmbed(url, info, og, msg.author);
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel("Open link")
+          );
+          await msg
+            .reply({ embeds: [embed], components: [row], allowedMentions: { repliedUser: false } })
+            .catch(() => null);
+        }
+      }
+    }
+  } catch (err) {
+    // Don't crash messageCreate if OG fetch fails
+    console.log("Tracker preview error:", err?.message || err);
+  }
+  // 5) Status guard
   enforceStatusGuard(msg);
 });
 
@@ -1366,6 +1738,226 @@ function getServerCfg(guildId) {
     calcRoleId: saved.calcRoleId || saved.justiceChefRoleId || JUSTICE_CHEF_ROLE_ID
   };
 }
+
+function normalizeDNFChannelIds(saved) {
+  const ids = [];
+  const candidates = [
+    saved?.panelChannelIds,
+    saved?.channelIds,
+    saved?.channels,
+    saved?.panelChannelId,
+    saved?.channelId,
+  ];
+
+  for (const c of candidates) {
+    if (!c) continue;
+    if (Array.isArray(c)) ids.push(...c);
+    else if (typeof c === "string") ids.push(c);
+  }
+
+  // de-dupe + sanitize
+  return [...new Set(ids.filter((x) => typeof x === "string" && x.trim().length > 0))];
+}
+
+function getDNFCfg(guildId) {
+  const gId = guildIdSafe(guildId);
+  const saved = dnfCfgStore[gId] || {};
+  const panelChannelIds = normalizeDNFChannelIds(saved);
+
+  // Migration: if older keys exist, normalize to panelChannelIds so newer code works.
+  if (
+    panelChannelIds.length > 0 &&
+    (!Array.isArray(saved.panelChannelIds) || saved.panelChannelIds.join(",") !== panelChannelIds.join(","))
+  ) {
+    dnfCfgStore[gId] = { ...saved, panelChannelIds };
+    writeJson(DNF_CFG_FILE, dnfCfgStore);
+  }
+
+  return {
+    roleId: saved.roleId || null,
+    panelChannelIds,
+  };
+}
+
+
+/**
+ * Reload full DNF config store from disk and return it.
+ * Useful on startup when we want to re-apply blocks using the latest persisted config.
+ */
+function loadDNFCfg() {
+  dnfCfgStore = readJson(DNF_CFG_FILE, {});
+  return dnfCfgStore;
+}
+
+function saveDNFCfg(guildId, cfg) {
+  const gId = guildIdSafe(guildId);
+  dnfCfgStore[gId] = {
+    roleId: cfg.roleId || null,
+    panelChannelIds: Array.from(new Set(cfg.panelChannelIds || [])).filter(Boolean),
+  };
+  writeJson(DNF_CFG_FILE, dnfCfgStore);
+}
+
+async function ensureDNFRole(guild) {
+  if (!guild) return null;
+
+  const cfg = getDNFCfg(guild.id);
+
+  if (cfg.roleId) {
+    const role =
+      guild.roles.cache.get(cfg.roleId) || (await guild.roles.fetch(cfg.roleId).catch(() => null));
+    if (role) return role;
+  }
+
+  const byName =
+    guild.roles.cache.find((r) => r.name.toLowerCase() === "does not finish order") || null;
+  if (byName) {
+    saveDNFCfg(guild.id, { roleId: byName.id, panelChannelIds: cfg.panelChannelIds });
+    return byName;
+  }
+
+  const created = await guild.roles
+    .create({
+      name: "does not finish order",
+      color: 0x000000,
+      hoist: false,
+      mentionable: false,
+      reason: "DNF role setup",
+    })
+    .catch(() => null);
+
+  if (created) {
+    saveDNFCfg(guild.id, { roleId: created.id, panelChannelIds: cfg.panelChannelIds });
+  }
+
+  return created;
+}
+
+async function lockChannelForDNF(target, channelIdOrRole, roleIdMaybe) {
+  try {
+    let channel = null;
+    let roleId = null;
+
+    // Support both call styles:
+    // 1) lockChannelForDNF(guild, channelId, roleId)
+    // 2) lockChannelForDNF(channel, roleOrRoleId)
+    if (target && typeof target === "object" && "permissionOverwrites" in target && "guild" in target) {
+      // Channel-first
+      channel = target;
+      const roleOrId = channelIdOrRole;
+      roleId = typeof roleOrId === "string" ? roleOrId : roleOrId?.id;
+    } else {
+      // Guild-first
+      const guild = target;
+      const channelId = channelIdOrRole;
+      roleId = roleIdMaybe;
+
+      if (!guild || !channelId || !roleId) return { ok: false, reason: "missing args" };
+      channel = await guild.channels.fetch(channelId).catch(() => null);
+    }
+
+    if (!channel) return { ok: false, reason: "channel not found" };
+    if (!roleId) return { ok: false, reason: "role not found" };
+
+    // Threads don't reliably support overwrites editing the same way as channels/categories.
+    if (typeof channel.isThread === "function" && channel.isThread()) {
+      return { ok: false, reason: "threads not supported (select the parent channel)" };
+    }
+
+    // IMPORTANT: deny ViewChannel AND ReadMessageHistory
+    await channel.permissionOverwrites.edit(
+      roleId,
+      {
+        ViewChannel: false,
+        ReadMessageHistory: false,
+      },
+      { reason: "DNF restriction (DOES NOT FINISH ORDER)" }
+    );
+
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e?.message || String(e) };
+  }
+}
+
+/**
+ * IMPORTANT Discord permission note:
+ * If a channel explicitly ALLOWS ViewChannel for a role the user has (e.g., "Hero in Training"),
+ * a DENY on another role (e.g., "DOES NOT FINISH ORDER") can be overridden by that allow.
+ * To guarantee restriction, we apply a MEMBER-specific overwrite deny for configured channels.
+ */
+async function setMemberDNFBlock(channel, memberId, shouldBlock) {
+  try {
+    if (!channel || !channel.permissionOverwrites) return;
+
+    if (shouldBlock) {
+      await channel.permissionOverwrites.edit(
+        memberId,
+        {
+          ViewChannel: false,
+          ReadMessageHistory: false,
+        },
+        { reason: "DNF: block member access" }
+      );
+    } else {
+      // Clear only the two permissions we manage (leave other member overwrites intact).
+      await channel.permissionOverwrites.edit(
+        memberId,
+        {
+          ViewChannel: null,
+          ReadMessageHistory: null,
+        },
+        { reason: "DNF: unblock member access" }
+      );
+    }
+  } catch (e) {
+    console.warn("[DNF] setMemberDNFBlock failed:", e?.message || e);
+  }
+}
+
+async function applyDNFBlocksForMember(guild, memberId, cfg, shouldBlock) {
+  try {
+    if (!guild || !cfg?.panelChannelIds?.length) return;
+
+    for (const channelId of cfg.panelChannelIds) {
+      const channel =
+        guild.channels.cache.get(channelId) ||
+        (await guild.channels.fetch(channelId).catch(() => null));
+      if (!channel) continue;
+      await setMemberDNFBlock(channel, memberId, shouldBlock);
+    }
+  } catch (e) {
+    console.warn("[DNF] applyDNFBlocksForMember failed:", e?.message || e);
+  }
+}
+
+async function reapplyDNFMemberBlocksOnStartup() {
+  try {
+    const cfgByGuild = loadDNFCfg();
+    const entries = Object.entries(cfgByGuild || {});
+    for (const [guildId, cfg] of entries) {
+      const guild = client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null));
+      if (!guild) continue;
+
+      const roleId = cfg?.roleId;
+      if (!roleId || !cfg?.panelChannelIds?.length) continue;
+
+      // Ensure we have members cached for role.members
+      await guild.members.fetch().catch(() => null);
+
+      const role = guild.roles.cache.get(roleId) || (await guild.roles.fetch(roleId).catch(() => null));
+      if (!role) continue;
+
+      for (const member of role.members.values()) {
+        await applyDNFBlocksForMember(guild, member.id, cfg, true);
+      }
+    }
+    console.log("[DNF] Startup member re-apply complete.");
+  } catch (e) {
+    console.warn("[DNF] reapplyDNFMemberBlocksOnStartup failed:", e?.message || e);
+  }
+}
+
 
 // Interaction reply helpers (prevents "thinking..." hangs if editReply fails)
 async function safeEditReply(interaction, payload) {
@@ -1420,12 +2012,27 @@ const cmdDelPay = new SlashCommandBuilder()
     o.setName("staff").setDescription("Staff user").setRequired(true)
   );
 
+// /editpay (interactive payment editor)
+const cmdEditPay = new SlashCommandBuilder()
+  .setName("editpay")
+  .setDescription("Interactively add/update/delete payment methods for a staff member")
+  .addUserOption(o =>
+    o.setName("staff").setDescription("Staff user").setRequired(true)
+  );
+
 // /pay
 const cmdPay = new SlashCommandBuilder()
   .setName("pay")
   .setDescription("Show payment options for a staff member.")
+  // Allow /pay to be used in DMs
+  .setDMPermission(true)
   .addUserOption(o =>
-    o.setName("staff").setDescription("Who is getting paid").setRequired(true)
+    // Optional so /pay works smoothly in DMs (defaults to the caller).
+    o.setName("staff").setDescription("Who is getting paid").setRequired(false)
+  )
+  .addStringOption(o => o.setName("staff_id").setDescription("Staff user ID (use this in DMs if staff is not in the DM)").setRequired(false))
+.addUserOption(o =>
+    o.setName("customer").setDescription("Optional customer to ping (overrides auto-detect in tickets)").setRequired(false)
   )
   .addNumberOption(o =>
     o.setName("amount").setDescription("Amount in USD")
@@ -1434,13 +2041,58 @@ const cmdPay = new SlashCommandBuilder()
     o.setName("note").setDescription("Optional note")
   );
 
+
+// /paycanada — Canada payment links (Wise + Stripe) + optional crypto preference
+const CANADA_WISE_URL = process.env.CANADA_WISE_URL || "https://wise.com/pay/me/carlosmanueln18";
+const CANADA_STRIPE_URL = process.env.CANADA_STRIPE_URL || "https://buy.stripe.com/7sY6oJboL4F50hxawx8og00";
+const CANADA_STRIPE_NOTE =
+  process.env.CANADA_STRIPE_NOTE ||
+  "NOTE: Stripe may add extra charges/fees. Please wait for the confirmed amount before paying.";
+
+const cmdPayCanada = new SlashCommandBuilder()
+  .setName("paycanada")
+  .setDescription("Show Canada payment options (Wise / Stripe / Crypto).")
+  .setDMPermission(true)
+  .addUserOption(o =>
+    o.setName("customer")
+      .setDescription("Optional customer to ping")
+      .setRequired(false)
+  )
+  .addNumberOption(o =>
+    o.setName("amount")
+      .setDescription("Optional amount (CAD)")
+      .setRequired(false)
+      .setMinValue(0)
+  )
+  .addStringOption(o =>
+    o.setName("crypto")
+      .setDescription("Optional: crypto preference")
+      .addChoices(
+        { name: "ETH", value: "ETH" },
+        { name: "LTC", value: "LTC" },
+        { name: "USDT", value: "USDT" }
+      )
+      .setRequired(false)
+  )
+  .addStringOption(o =>
+    o.setName("note")
+      .setDescription("Optional note")
+      .setRequired(false)
+      .setMaxLength(1000)
+  );
+
+
 // /showpay
 const cmdShowPay = new SlashCommandBuilder()
   .setName("showpay")
   .setDescription("Show saved payment methods for a staff member (no amount).")
+  // Allow /showpay to be used in DMs
+  .setDMPermission(true)
   .addUserOption(o =>
-    o.setName("staff").setDescription("Staff user").setRequired(true)
+    // Optional so /showpay works smoothly in DMs (defaults to the caller).
+    o.setName("staff").setDescription("Staff user").setRequired(false)
   )
+  .addStringOption(o => o.setName("staff_id").setDescription("Staff user ID (use this in DMs if staff is not in the DM)").setRequired(false))
   .addStringOption(o =>
     o.setName("note").setDescription("Optional note")
   );
@@ -1642,6 +2294,47 @@ const cmdVouchRemove = new SlashCommandBuilder()
     o.setName("note").setDescription("Optional reason / note").setRequired(false)
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+// /vouchchecker
+const cmdVouchChecker = new SlashCommandBuilder()
+  .setName("vouchchecker")
+  .setDescription("Scan vouch messages in a channel, rebuild vouch counts, and (optionally) mark each vouch with ✅.")
+  .addChannelOption(o =>
+    o.setName("channel")
+      .setDescription("Channel to scan (default: current channel)")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+  )
+    .addBooleanOption(o =>
+    o.setName("all_channels")
+      .setDescription("Scan ALL vouch channels in this server (recommended). If set, the channel option is ignored.")
+  )
+.addIntegerOption(o =>
+    o.setName("limit")
+      .setDescription("How many recent messages to scan (max 3000)")
+      .setMinValue(50)
+      .setMaxValue(3000)
+  )
+  .addBooleanOption(o =>
+    o.setName("react")
+      .setDescription("React ✅ to each detected vouch message (default: true)")
+      .setRequired(false)
+  )
+  .addBooleanOption(o =>
+    o.setName("apply")
+      .setDescription("Overwrite stored vouch counts using the scan results (default: false / preview-only)")
+      .setRequired(false)
+  )
+  .addBooleanOption(o =>
+    o.setName("sync_roles")
+      .setDescription("Update customer loyalty roles (safe: upgrade-only). Requires apply=true (default: false)")
+      .setRequired(false)
+  )
+  .addBooleanOption(o =>
+    o.setName("force")
+      .setDescription("DANGEROUS: allow downgrades + full overwrite (use only if you're sure the scan is complete)")
+      .setRequired(false)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+
 
 
 // Announce
@@ -1687,31 +2380,84 @@ const cmdUEInspect = new SlashCommandBuilder()
   .addStringOption(o =>
     o.setName("url").setDescription("Uber Eats link").setRequired(true)
   );
+
+// /track (best-effort order link preview)
+// NOTE: We can build a helpful embed with parsed IDs/URLs, but we cannot reliably fetch
+// live order status (driver, ETA, etc.) without official APIs/auth.
+const cmdTrack = new SlashCommandBuilder()
+  .setName("track")
+  .setDescription("Preview an Uber Eats / DoorDash link (best-effort).")
+  .setDMPermission(true)
+  .addStringOption(o =>
+    o.setName("url").setDescription("Paste a DoorDash/UberEats link").setRequired(true)
+  )
+  .addBooleanOption(o =>
+    o.setName("public").setDescription("If true, post publicly (default: ephemeral)").setRequired(false)
+  );
 // /calc (customer pay calculator)
 const cmdCalc = new SlashCommandBuilder()
   .setName("calc")
-  .setDescription("Calculate what the customer should pay (cost + fee, with discount roles).")
-  .addNumberOption(o =>
-    o.setName("cost")
-      .setDescription("What it costs us (staff cost) in USD")
-      .setRequired(true)
-      .setMinValue(0)
+  .setDescription("Calculate what the customer should pay (cost + fee, with discount roles) + optional % math.")
+  // Enabled for DMs (User Install) via integration_types/contexts wrapper below.
+  .setDMPermission(true)
+  .addNumberOption((o) =>
+    o.setName("cost").setDescription("Order cost (before fees/discounts)").setRequired(true)
   )
-  .addNumberOption(o =>
-    o.setName("fee")
-      .setDescription(`Service fee (default: $${DEFAULT_SERVICE_FEE})`)
+  .addNumberOption((o) =>
+    o
+      .setName("fee")
+      .setDescription(`Flat fee to add on top (default: ${DEFAULT_SERVICE_FEE})`)
+      .setRequired(false)
+  )
+  .addBooleanOption((o) =>
+  o
+    .setName("subtract_fee")
+    .setDescription("Subtract the service fee from the total (use only if cost already includes fee). Default: OFF")
+    .setRequired(false)
+)
+.addIntegerOption((o) =>
+    o
+      .setName("preset_percent")
+      .setDescription("Quick % presets (applies to COST)")
+      .setRequired(false)
+      .addChoices(
+        { name: "10%", value: 10 },
+        { name: "15%", value: 15 },
+        { name: "20%", value: 20 },
+        { name: "25%", value: 25 },
+        { name: "30%", value: 30 },
+        { name: "35%", value: 35 },
+        { name: "40%", value: 40 },
+        { name: "45%", value: 45 },
+        { name: "50%", value: 50 },
+        { name: "55%", value: 55 },
+        { name: "60%", value: 60 }
+      )
+  )
+  .addNumberOption((o) =>
+    o
+      .setName("percent")
+      .setDescription("Custom percentage (e.g. 18.5) applied to COST")
       .setRequired(false)
       .setMinValue(0)
       .setMaxValue(1000)
   )
-  .addUserOption(o =>
-    o.setName("customer")
-      .setDescription("Customer to check discount roles for (default: ticket opener / you)")
+  .addBooleanOption((o) =>
+    o
+      .setName("percent_table")
+      .setDescription("Show a 10%–60% table for COST")
       .setRequired(false)
   )
-  .addBooleanOption(o =>
-    o.setName("public")
-      .setDescription("Post publicly in the channel (default: ephemeral)")
+  .addUserOption((o) =>
+    o
+      .setName("customer")
+      .setDescription("Customer to check discount roles for (server only)")
+      .setRequired(false)
+  )
+  .addBooleanOption((o) =>
+    o
+      .setName("public")
+      .setDescription("If true, shows publicly (default: ephemeral)")
       .setRequired(false)
   );
 
@@ -1737,6 +2483,22 @@ const cmdClaim = new SlashCommandBuilder()
       .setDescription("User to attach this ticket to (required unless unclaim=true)")
       .setRequired(false)
   )
+  .addStringOption(o =>
+    o.setName("category")
+      .setDescription("Optional: rename using a category instead of the server name")
+      .addChoices(
+        { name: "Uber Eats", value: "ue" },
+        { name: "DoorDash", value: "dd" },
+        { name: "Custom", value: "custom" }
+      )
+      .setRequired(false)
+  )
+  .addStringOption(o =>
+    o.setName("custom")
+      .setDescription("If category=Custom, enter the label (ex: yukis-cafe)")
+      .setRequired(false)
+      .setMaxLength(50)
+  )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
 
 // Host URL (for transcript links)
@@ -1751,9 +2513,62 @@ const cmdHostUrlSet = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 
-// Auto close NOW (manual test / emergency)
-// Restrict via default permissions + runtime check.
-// Auto close/open NOW (manual override; optional announcement + custom message)
+const cmdDNFSetup = new SlashCommandBuilder()
+  .setName("dnf_setup")
+  .setDescription("Create/ensure the 'does not finish order' role and lock a panel channel (default: this channel).")
+  .addChannelOption(o =>
+    o.setName("channel")
+      .setDescription("Panel channel OR category to lock (where TicketTool posts the ticket embed)")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory)
+      .setRequired(false)
+  )
+  .addChannelOption(o =>
+    o.setName("channel_2")
+      .setDescription("Optional: another channel/category to lock")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory)
+      .setRequired(false)
+  )
+  .addChannelOption(o =>
+    o.setName("channel_3")
+      .setDescription("Optional: another channel/category to lock")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory)
+      .setRequired(false)
+  )
+  .addChannelOption(o =>
+    o.setName("channel_4")
+      .setDescription("Optional: another channel/category to lock")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory)
+      .setRequired(false)
+  )
+  .addChannelOption(o =>
+    o.setName("channel_5")
+      .setDescription("Optional: another channel/category to lock")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory)
+      .setRequired(false)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+
+const cmdDNFAdd = new SlashCommandBuilder()
+  .setName("dnf_add")
+  .setDescription("Give the DNF role to a user (hides registered panel channels).")
+  .addUserOption(o =>
+    o.setName("user")
+      .setDescription("User to restrict")
+      .setRequired(true)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
+
+const cmdDNFRemove = new SlashCommandBuilder()
+  .setName("dnf_remove")
+  .setDescription("Remove the DNF role from a user.")
+  .addUserOption(o =>
+    o.setName("user")
+      .setDescription("User to unrestrict")
+      .setRequired(true)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
+
+// NEW (preferred): /dnf setup|add|remove  (shows as “/dnf setup” etc.)
 const cmdAutoCloseNow = new SlashCommandBuilder()
   .setName("autoclose_now")
   .setDescription("Set the server to CLOSED or ON BREAK right now (locks orders + updates status).")
@@ -1847,7 +2662,23 @@ const cmdAutoOpenNow = new SlashCommandBuilder()
 const cmdHelp = new SlashCommandBuilder()
   .setName("help")
   .setDescription("Show bot commands.");
-
+// Guide
+const cmdGuide = new SlashCommandBuilder()
+  .setName("guide")
+  .setDescription("Show a full guide on how to use the bot.")
+  .setDMPermission(true)
+  .addStringOption(o =>
+    o.setName("topic")
+      .setDescription("Optional: jump to a specific topic")
+      .addChoices(
+        { name: "Getting Started / Setup", value: "setup" },
+        { name: "Payments (/setpay, /pay, /paycanada)", value: "payments" },
+        { name: "Calculator (/calc)", value: "calc" },
+        { name: "Tickets (/claim, /closeticket, /closealltickets)", value: "tickets" },
+        { name: "Vouches (/vouch, /vouchchecker)", value: "vouches" },
+        { name: "Link Tracker (/track)", value: "track" }
+      )
+  );
 // Order perms debug
 const cmdOrderPerms = new SlashCommandBuilder()
   .setName("orderperms")
@@ -1857,11 +2688,32 @@ const cmdOrderPerms = new SlashCommandBuilder()
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
-const COMMANDS = [
+/**
+ * Discord has *installation contexts*.
+ *
+ * To make a slash command appear in DMs ("Apps" list / DM command picker),
+ * it must be enabled for **User Install** and for **DM contexts**.
+ *
+ * The API fields are:
+ * - integration_types: [0, 1]  -> Guild Install + User Install
+ * - contexts: [0, 1, 2]        -> Guild + Bot DM + Private Channel
+ */
+function withDMContexts(cmdJson) {
+  return {
+    ...cmdJson,
+    dm_permission: true,
+    integration_types: [0, 1],
+    contexts: [0, 1, 2]
+  };
+}
+
+const COMMAND_BUILDERS = [
   cmdScanPromos,
   cmdSetPay,
   cmdDelPay,
+  cmdEditPay,
   cmdPay,
+  cmdPayCanada,
   cmdShowPay,
   cmdBumpConfig,
   cmdBump,
@@ -1873,31 +2725,87 @@ const COMMANDS = [
   cmdVouchCount,
   cmdVouchAdd,
   cmdVouchRemove,
+  cmdVouchChecker,
   cmdAnnounce,
   cmdSayEmbed,
   cmdInvoice,
   cmdUEInspect,
+  cmdTrack,
   cmdCalc,
   cmdCloseTicket,
   cmdClaim,
+  cmdDNFAdd,
+  cmdDNFRemove,
   cmdHostUrlSet,
   cmdAutoCloseNow,
   cmdAutoOpenNow,
+  cmdGuide,
   cmdHelp
-].map(c => c.toJSON());
+];
+
+const ALL_COMMANDS_JSON = COMMAND_BUILDERS.map((builder) => {
+  const json = builder.toJSON();
+  if (json?.name === "pay" || json?.name === "showpay" || json?.name === "paycanada" || json?.name === "calc" || json?.name === "track" || json?.name === "guide") return withDMContexts(json);
+  return json;
+});
+
+// Register ONLY /pay + /showpay as GLOBAL commands (so they can appear in DMs).
+// Keep the rest as GUILD commands for faster propagation + to avoid cluttering DM command pickers.
+const GLOBAL_COMMAND_NAMES = new Set(["pay", "showpay", "paycanada", "calc", "track", "guide"]);
+const GLOBAL_COMMANDS = ALL_COMMANDS_JSON.filter(c => GLOBAL_COMMAND_NAMES.has(c?.name));
+const GUILD_COMMANDS = ALL_COMMANDS_JSON.filter(c => !GLOBAL_COMMAND_NAMES.has(c?.name));
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationCommands(process.env.CLIENT_ID),
-    { body: COMMANDS }
-  );
-  console.log("✅ Slash commands registered");
+
+  // ✅ Always register DM-friendly commands globally.
+  // Global command propagation can take a while, but these are the only ones we need in DMs.
+  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: GLOBAL_COMMANDS });
+  console.log("✅ Slash commands registered (GLOBAL: /pay /showpay /paycanada /calc /track /guide)");
+
+  // NOTE:
+  // We intentionally do NOT register all commands globally.
+  // Instead, we register the remaining commands per-guild on READY.
+  // That makes them show up fast in *every* server the bot is in.
+}
+
+async function registerGuildCommandsForAllGuilds(client) {
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+  const appId = process.env.CLIENT_ID;
+  if (!appId) return;
+
+  // Ensure we have the latest guild list
+  try { await client.guilds.fetch(); } catch {}
+
+  const guildIds = [...client.guilds.cache.keys()];
+  if (!guildIds.length) return;
+
+  // Optional: if you set GUILD_ID, we still register there first (nice for logs/testing)
+  const priority = process.env.GUILD_ID ? [process.env.GUILD_ID] : [];
+  const ordered = [...new Set([...priority, ...guildIds])];
+
+  for (const gid of ordered) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(appId, gid), { body: GUILD_COMMANDS });
+      console.log(`✅ Guild commands registered for guild ${gid} (${GUILD_COMMANDS.length} commands)`);
+      // tiny delay to reduce rate-limit risk if you add the bot to many servers
+      await sleep(450);
+    } catch (e) {
+      console.log(`⚠️ Guild command register failed for ${gid}:`, e?.message || e);
+      await sleep(800);
+    }
+  }
 }
 
 // ============================================
 // FLEXIBLE PAYMENT SYSTEM
 // ============================================
+
+function safeInlineCode(value) {
+  // Discord inline-code uses backticks. If the value contains backticks, replace them with a similar char.
+  const s = String(value ?? "");
+  return `\`${s.replace(/`/g, "ˋ")}\``;
+}
 
 function buildPayEmbed(requester, staff, info, amount, note, openerId) {
   const e = new EmbedBuilder()
@@ -1918,11 +2826,19 @@ function buildPayEmbed(requester, staff, info, amount, note, openerId) {
     e.addFields({ name: "Note", value: note, inline: false });
   }
 
-  const methodFields = Object.entries(info.methods || {}).map(([method, value]) => ({
-    name: method,
-    value: value,
-    inline: true
-  }));
+  // Make payment identifiers easy to copy on mobile by rendering them as inline-code (`like this`).
+  // If a value is a URL, keep it normal so it remains clickable (buttons also include the URL).
+  const methodFields = Object.entries(info.methods || {})
+    .filter(([, v]) => v)
+    .map(([method, value]) => {
+      const raw = String(value);
+      const isUrl = /^https?:\/\//i.test(raw);
+      return {
+        name: method,
+        value: isUrl ? raw.slice(0, 1024) : safeInlineCode(raw).slice(0, 1024),
+        inline: true
+      };
+    });
 
   if (methodFields.length) e.addFields(methodFields);
 
@@ -1930,53 +2846,73 @@ function buildPayEmbed(requester, staff, info, amount, note, openerId) {
 }
 
 // Auto-split buttons into rows of max 5
-function buildPayButtons(info) {
-  const methods = Object.entries(info.methods || {});
+// IMPORTANT: Use per-message storage so "Copy" buttons always copy the RIGHT user's value.
+// The older approach searched payStore by method name, which breaks when multiple staff share method names (e.g., "Venmo").
+// We store a short-lived map: messageId -> { methodName -> value }.
+const payMsgMap = new Map(); // messageId -> { [methodName]: value }
+
+function buildPayButtons(info, staffId) {
+  // Copy/Open buttons for payment methods.
+  // We encode staffId into the customId so button clicks always resolve to the right profile,
+  // even if the bot restarts (in-memory maps would be cleared).
   const rows = [];
-  let currentRow = new ActionRowBuilder();
 
-  for (const [method, value] of methods) {
-    // Copy button
-    const encodedName = encodeURIComponent(method);
+  const methods = info?.methods || {};
+  const orderedMethods = [
+    ...PAY_METHODS_ORDER.filter((m) => methods[m]),
+    ...Object.keys(methods).filter((m) => !PAY_METHODS_ORDER.includes(m)),
+  ];
 
-    // If row full, push and start new
-    if (currentRow.components.length === 5) {
-      rows.push(currentRow);
-      currentRow = new ActionRowBuilder();
-    }
+  // Discord: max 5 buttons per row, max 5 rows
+  let row = new ActionRowBuilder();
+  let rowCount = 0;
 
-    currentRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`pay:copy:${encodedName}`)
-        .setStyle(ButtonStyle.Secondary)
-        .setLabel(method.length > 20 ? method.slice(0, 17) + "..." : method)
-    );
+  for (const method of orderedMethods) {
+    const value = methods[method];
+    if (!value) continue;
 
-    // If it's a URL, also add an "Open" link button
-    if (/^https?:\/\//i.test(value)) {
-      if (currentRow.components.length === 5) {
-        rows.push(currentRow);
-        currentRow = new ActionRowBuilder();
-      }
+    const encodedMethod = encodeURIComponent(method);
+    const copyBtn = new ButtonBuilder()
+      .setCustomId(`pay:copy:${staffId}:${encodedMethod}`)
+      .setLabel(method)
+      .setStyle(ButtonStyle.Secondary);
 
-      currentRow.addComponents(
-        new ButtonBuilder()
+    const isUrl = /^https?:\/\//i.test(String(value).trim());
+    const openBtn = isUrl
+      ? new ButtonBuilder()
+          .setLabel(`Open ${method}`)
           .setStyle(ButtonStyle.Link)
-          .setLabel(`Open ${method.length > 16 ? method.slice(0, 13) + "..." : method}`)
-          .setURL(value)
-      );
+          .setURL(String(value).trim())
+      : null;
+
+    if (row.components.length >= 5) {
+      rows.push(row);
+      rowCount += 1;
+      row = new ActionRowBuilder();
+      if (rowCount >= 5) break;
+    }
+    row.addComponents(copyBtn);
+
+    if (openBtn) {
+      if (row.components.length >= 5) {
+        rows.push(row);
+        rowCount += 1;
+        row = new ActionRowBuilder();
+        if (rowCount >= 5) break;
+      }
+      row.addComponents(openBtn);
     }
   }
 
-  if (currentRow.components.length > 0) {
-    rows.push(currentRow);
-  }
+  if (row.components.length && rowCount < 5) rows.push(row);
 
   return rows;
 }
 
+
 // ============================================
 // TICKET OPENER DETECTION (TicketTool-aware)
+
 // ============================================
 
 async function fetchAllMessages(channel, limit = 300) {
@@ -2068,6 +3004,32 @@ async function syncCustomerTierRoles(guild, member, count) {
     if (role) {
       await member.roles.add(role).catch(() => {});
     }
+  }
+}
+
+// Upgrade-only tier sync (won't remove higher roles).
+// Used by /vouchchecker in "safe" mode so we don't accidentally downgrade customers
+// if some older vouches fail to parse.
+async function syncCustomerTierRolesUpgradeOnly(guild, member, count) {
+  if (!guild || !member) return;
+
+  const tier = tierForCount(count);
+  if (!tier?.roleId) return;
+
+  const desiredRoleId = tier.roleId;
+
+  // If they already have the desired role (or a higher tier), do nothing.
+  // Higher tiers are later in this list.
+  const tiersHighToLow = [VILTRUMITE_ROLE_ID, FREQUENT_BUYER_ROLE_ID, VERIFIED_BUYER_ROLE_ID].filter(Boolean);
+  const currentIndex = tiersHighToLow.findIndex(rid => member.roles.cache.has(rid));
+  const desiredIndex = tiersHighToLow.findIndex(rid => rid === desiredRoleId);
+
+  // If they already have a tier role and it's higher (smaller index), don't change.
+  if (currentIndex !== -1 && desiredIndex !== -1 && currentIndex <= desiredIndex) return;
+
+  const role = guild.roles.cache.get(desiredRoleId);
+  if (role) {
+    await member.roles.add(role).catch(() => {});
   }
 }
 
@@ -2382,61 +3344,181 @@ client.on("interactionCreate", async interaction => {
           ephemeral: true
         });
       }
+
+      // /editpay modal submit
+      if (interaction.customId.startsWith("payedit:modal:")) {
+        const parts = interaction.customId.split(":");
+        // payedit:modal:<staffId>
+        const staffId = parts[2];
+
+        const rawName = interaction.fields.getTextInputValue("method_name").trim();
+const methodValue = interaction.fields.getTextInputValue("method_value").trim();
+
+if (!rawName) {
+  return interaction.reply({ content: "❌ Please enter a payment method name.", ephemeral: true });
+}
+if (!methodValue) {
+  return interaction.reply({ content: "❌ Please enter the payment details/link/handle for that method.", ephemeral: true });
+}
+
+// Normalize (but allow custom methods too)
+const methodName = canonicalizePaymentMethodName(rawName);
+
+// Save
+if (!payStore[staffId]) payStore[staffId] = {};
+payStore[staffId][methodName] = { value: methodValue, note: "" };
+
+        writeJson("pay.json", payStore);
+
+        // Rebuild panel (ephemeral messages can't be fetched/edited by ID reliably, so we send a fresh updated panel)
+        let staffMember = null;
+        try {
+          staffMember = await interaction.guild.members.fetch(staffId);
+        } catch {}
+
+        const panel = buildEditPayPanel(staffMember || interaction.member, payStore[staffId]);
+        return interaction.reply({
+          ...panel,
+          ephemeral: true
+        });
+      }
     }
 
         // ========== BUTTONS ==========
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // Bump copy button
-      if (id === "bump:copy") {
-        const mention = getDisboardCommandMention(interaction.guildId);
+      // /editpay panel buttons
+      // customId format: payedit:<action>:<staffId>:<channelId>:<messageId>
+      if (id.startsWith("payedit:")) {
+        const parts = id.split(":");
+        const action = parts[1];
+        const staffId = parts[2];
+        const hasJusticeChefRole = interaction.member?.roles?.cache?.has(JUSTICE_CHEF_ROLE_ID);
+        if (!hasJusticeChefRole && !interaction.memberPermissions?.has("ManageGuild")) {
+          return interaction.reply({ content: "You don't have permission to do that.", ephemeral: true });
+        }
 
-        // IMPORTANT:
-        // To get Discord's built-in "Copy" button UI on mobile, the message content
-        // must be ONLY a code block (no extra text before/after).
-        // So we put any extra info in an embed, and keep content as just ```/bump```.
-        const infoEmbed = new EmbedBuilder()
-          .setColor(0x34d399)
-          .setTitle("DISBOARD Bump")
-          .setDescription(
-            mention
-              ? `Tap the clickable command if configured:\n${mention}\n\nOr copy /bump below.`
-              : "Copy /bump below and run it in the bump channel."
+        if (!staffId) {
+          return interaction.reply({ content: "Invalid pay editor state. Please run `/editpay` again.", ephemeral: true });
+        }
+
+        // ADD / UPDATE
+        if (action === "add") {
+          const modal = new ModalBuilder()
+            .setCustomId(`payedit:modal:${staffId}`)
+            .setTitle("Add / Update payment method");
+
+          const nameInput = new TextInputBuilder()
+            .setCustomId("method_name")
+            .setLabel("Method name (e.g., Cash App)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(50);
+
+          const valueInput = new TextInputBuilder()
+            .setCustomId("method_value")
+            .setLabel("Handle / link")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(150);
+
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(nameInput),
+            new ActionRowBuilder().addComponents(valueInput)
           );
 
+          return interaction.showModal(modal);
+        }
+
+        // DELETE ONE
+        if (action === "del") {
+          const entry = payStore[staffId];
+          const methods = entry?.methods || {};
+          const names = Object.keys(methods);
+
+          if (!names.length) {
+            return interaction.reply({ content: "No payment methods saved for that staff member.", ephemeral: true });
+          }
+
+          const options = names.slice(0, 25).map((n) => ({
+            label: n.length > 100 ? n.slice(0, 97) + "..." : n,
+            value: encodeURIComponent(n),
+          }));
+
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId(`payedit_del_select:${staffId}:${interaction.channelId}:${interaction.message.id}`)
+            .setPlaceholder("Select a method to delete")
+            .addOptions(options);
+
+          return interaction.reply({
+            content: "Choose the method you want to delete:",
+            components: [new ActionRowBuilder().addComponents(menu)],
+            ephemeral: true,
+          });
+        }
+
+        // CLEAR ALL
+        if (action === "clear") {
+          if (!payStore[staffId]) payStore[staffId] = { name: null, methods: {} };
+          payStore[staffId].methods = {};
+          writeJson("pay.json", payStore);
+
+          const payload = buildEditPayPanel({ guild: interaction.guild, staffId });
+          return interaction.update(payload);
+        }
+
+        // DONE (remove components)
+        if (action === "done") {
+          const payload = buildEditPayPanel({ guild: interaction.guild, staffId });
+          payload.components = [];
+          return interaction.update(payload);
+        }
+
+        return interaction.reply({ content: "Unknown action. Please run `/editpay` again.", ephemeral: true });
+      }
+
+      // Bump copy button
+      if (id === "bump:copy") {
+        // Match the "tap-to-copy" behavior you showed (/purchase):
+        // send the command as *inline code*. On mobile, tapping the inline-code snippet copies it.
         return interaction.reply({
-          content: "```/bump```",
-          embeds: [infoEmbed],
+          content: "`/bump`",
           ephemeral: true
         });
       }
 
       // Pay copy buttons: pay:copy:<encodedMethodName>
       if (id.startsWith("pay:copy:")) {
-        const encoded = id.split("pay:copy:")[1] || "";
-        const methodName = decodeURIComponent(encoded);
+        // Format: pay:copy:<staffId>:<encodedMethod>
+        const parts = id.split(":");
+        const staffId = parts.length >= 4 ? parts[2] : null;
+        const methodName =
+          parts.length >= 4
+            ? decodeURIComponent(parts.slice(3).join(":"))
+            : id.slice("pay:copy:".length);
 
-        // Try to read the last /pay embed to find the staff member mentioned in title (best-effort),
-        // otherwise fall back to just saying "Copied".
-        // We store by methodName only, so we need to search payStore for a matching method.
-        let value = null;
-        for (const staffId of Object.keys(payStore)) {
-          const info = payStore[staffId];
-          if (info?.methods && Object.prototype.hasOwnProperty.call(info.methods, methodName)) {
-            value = info.methods[methodName];
-            break;
-          }
+        if (!staffId || !payStore[staffId]) {
+          return interaction.reply({
+            content:
+              "That payment button is outdated (or the bot restarted). Please run `/pay` again.",
+            ephemeral: true,
+          });
         }
 
-        if (!value) {
-          return interaction.reply({ content: "Couldn't find that payment value.", ephemeral: true });
+        const info = payStore[staffId];
+        const val = info?.methods?.[methodName];
+
+        if (!methodName || !val) {
+          return interaction.reply({
+            content: `No value found for **${methodName || "that method"}** on <@${staffId}>.`,
+            ephemeral: true,
+          });
         }
 
         return interaction.reply({
-          content: `✅ Copy this:
-\`\`\`${String(value)}\`\`\``,
-          ephemeral: true
+          content: safeInlineCode(String(val)),
+          ephemeral: true,
         });
       }
 
@@ -2500,8 +3582,290 @@ client.on("interactionCreate", async interaction => {
     }
 
     // ========== SLASH COMMANDS ==========
+    // String select menus (/editpay delete)
+    if (interaction.isStringSelectMenu()) {
+      const id = interaction.customId || "";
+      if (id.startsWith("payedit_del_select:")) {
+        const parts = id.split(":");
+        const staffId = parts[1];
+        const channelId = parts[2];
+        const messageId = parts[3];
+
+        const hasJusticeChefRole = interaction.member?.roles?.cache?.has(JUSTICE_CHEF_ROLE_ID);
+        if (!hasJusticeChefRole && !interaction.memberPermissions?.has("ManageGuild")) {
+          return interaction.reply({ content: "You don't have permission to use this menu.", ephemeral: true });
+        }
+
+        const encoded = interaction.values?.[0];
+        let methodName = null;
+        try {
+          methodName = Buffer.from(encoded, "base64url").toString("utf8");
+        } catch {
+          methodName = encoded;
+        }
+
+        const entry = payStore[staffId] || { name: null, methods: {} };
+        if (!entry.methods || !Object.prototype.hasOwnProperty.call(entry.methods, methodName)) {
+          return interaction.update({ content: "That method no longer exists.", components: [] }).catch(() => {});
+        }
+
+        delete entry.methods[methodName];
+        payStore[staffId] = entry;
+        writeJson("pay.json", payStore);
+
+        // Try to refresh the original panel message (best effort)
+        if (interaction.guild && channelId && messageId) {
+          try {
+            const panelChannel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+            const panelMessage = panelChannel?.isTextBased() ? await panelChannel.messages.fetch(messageId).catch(() => null) : null;
+            if (panelMessage) {
+              const { embeds, components } = buildEditPayPanel({ guild: interaction.guild, staffId });
+              await panelMessage.edit({ embeds, components }).catch(() => {});
+            }
+          } catch {}
+        }
+
+        return interaction.update({
+          content: `✅ Deleted **${methodName}**.`,
+          components: []
+        });
+      }
+    }
+
+    // Channel select menus (DNF setup)
+    if (interaction.isChannelSelectMenu()) {
+      const id = interaction.customId || "";
+      if (id.startsWith("dnf_setup_select:")) {
+        const parts = id.split(":");
+        const guildId = parts[1];
+        const ownerId = parts[2];
+
+        if (!interaction.guild || interaction.guild.id !== guildId) {
+          return interaction.reply({
+            content: "This DNF setup menu is no longer valid for this server.",
+            ephemeral: true,
+          });
+        }
+
+        if (ownerId && interaction.user.id !== ownerId) {
+          return interaction.reply({
+            content: "Only the person who opened this DNF setup can use this menu.",
+            ephemeral: true,
+          });
+        }
+
+        // Apply and save
+        const cfg = getDNFCfg(guildId);
+        const role = await ensureDNFRole(interaction.guild, cfg);
+
+        const selectedIds = Array.isArray(interaction.values) ? interaction.values : [];
+        const newlySelected = selectedIds.filter((cid) => !cfg.panelChannelIds.includes(cid));
+        cfg.panelChannelIds = Array.from(new Set([...cfg.panelChannelIds, ...selectedIds]));
+        saveDNFCfg(guildId, cfg);
+
+        // Lock every configured channel (keeps things consistent if configs were edited)
+        let ok = 0;
+        let fail = 0;
+        for (const channelId of cfg.panelChannelIds) {
+          const c = interaction.guild.channels.cache.get(channelId);
+          if (!c) continue;
+          try {
+            await lockChannelForDNF(c, role);
+            ok++;
+          } catch (e) {
+            fail++;
+          }
+        }
+
+        return interaction.update({
+          content:
+            `✅ DNF setup saved.\n` +
+            `• Role: <@&${role.id}>\n` +
+            `• Total locked channels: ${cfg.panelChannelIds.length}\n` +
+            `• Newly added: ${newlySelected.length}\n` +
+            (fail ? `\n⚠️ Failed to lock ${fail} channel(s). Make sure the bot has **Manage Channels** and its role is above the DNF role.` : ""),
+          components: [],
+        });
+      }
+    }
+
     if (!interaction.isChatInputCommand()) return;
     const cmd = interaction.commandName;
+
+    // Preferred syntax: /dnf setup|add|remove
+    // (We keep legacy /dnf_setup, /dnf_add, /dnf_remove for compatibility.)
+
+
+
+// DNF role + panel channel lock (Option A: panel channels only)
+if (cmd === "dnf_setup") {
+  const guild = interaction.guild;
+  if (!guild) {
+    return interaction.reply({ content: "This command must be used in a server.", ephemeral: true });
+  }
+
+  const can =
+    interaction.member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+    interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+    interaction.member.permissions.has(PermissionFlagsBits.ManageRoles);
+
+  if (!can) {
+    return interaction.reply({
+      content: "You need **Manage Server**, **Manage Channels**, or **Manage Roles** to run this.",
+      ephemeral: true,
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const role = await ensureDNFRole(guild);
+  if (!role) {
+    return interaction.editReply("I couldn't create/find the **does not finish order** role. Make sure I have **Manage Roles**.");
+  }
+
+  const picked = [
+    interaction.options.getChannel("channel"),
+    interaction.options.getChannel("channel_2"),
+    interaction.options.getChannel("channel_3"),
+    interaction.options.getChannel("channel_4"),
+    interaction.options.getChannel("channel_5"),
+  ].filter(Boolean);
+
+  // If the user didn't specify any channels, present a multi-select channel menu.
+  // This allows selecting way more than 5 channels (Discord supports up to 25 selections).
+  if (picked.length === 0) {
+    const menu = new ChannelSelectMenuBuilder()
+      .setCustomId(`dnf_setup_select:${guild.id}:${interaction.user.id}`)
+      .setPlaceholder("Select channel(s) to block DNF from")
+      .setMinValues(1)
+      .setMaxValues(25);
+
+    const row = new ActionRowBuilder().addComponents(menu);
+
+    // Store roleId now so the selection handler can immediately apply overwrites.
+    const cfg = getDNFCfg(guild.id);
+    saveDNFCfg(guild.id, { roleId: role.id, panelChannelIds: cfg.panelChannelIds || [] });
+
+    return interaction.editReply({
+      content:
+        "Pick the channel(s) you want **DNF** to be unable to **View Channel** and **Read Message History** in.\n" +
+        "(If someone has **Administrator**, Discord will still let them see everything — that can't be overridden.)",
+      components: [row],
+    });
+  }
+
+  const pickedIds = picked.filter((c) => c && c.id).map((c) => c.id);
+  if (pickedIds.length === 0) {
+    return interaction.editReply("I couldn't determine which channel(s) to lock.");
+  }
+
+  const cfg = getDNFCfg(guild.id);
+  const panelIds = Array.from(new Set([...(cfg.panelChannelIds || []), ...pickedIds]));
+
+  // Save config first
+  saveDNFCfg(guild.id, { roleId: role.id, panelChannelIds: panelIds });
+
+  let locked = 0;
+  let failed = 0;
+  for (const chId of panelIds) {
+    const res = await lockChannelForDNF(guild, chId, role.id);
+    if (res.ok) locked++;
+    else failed++;
+  }
+
+  return interaction.editReply(
+    [
+      `✅ **DNF role ready:** <@&${role.id}>`,
+      `🔒 Locked **${locked}** panel channel(s)` + (failed ? ` (⚠️ ${failed} failed)` : ""),
+      `Registered panels: ${panelIds.map((id) => `<#${id}>`).join(", ")}`,
+    ].join("\n")
+  );
+}
+
+if (cmd === "dnf_add") {
+  const guild = interaction.guild;
+  if (!guild) return interaction.reply({ content: "This command must be used in a server.", ephemeral: true });
+
+  const can =
+    interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) ||
+    interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+
+  if (!can) {
+    return interaction.reply({ content: "You need **Manage Roles** to run this.", ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const role = await ensureDNFRole(guild);
+  if (!role) {
+    return interaction.editReply("I couldn't create/find the **does not finish order** role. Make sure I have **Manage Roles**.");
+  }
+
+  const user = interaction.options.getUser("user", true);
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) return interaction.editReply("I couldn't find that user in this server.");
+
+  await member.roles.add(role.id).catch((e) => {
+    throw new Error(e?.message || String(e));
+  });
+
+  // Guarantee the member is blocked from configured channels (member-specific deny)
+  const cfg = getDNFCfg(guild.id);
+  await applyDNFBlocksForMember(guild, member.id, cfg, true);
+
+  // Re-apply channel locks in case setup was run before the bot had perms
+  // or if more panel channels were added later.
+  const panelIds = Array.isArray(cfg.panelChannelIds) ? cfg.panelChannelIds : [];
+  let locked = 0;
+  let failed = 0;
+  for (const channelId of panelIds) {
+    const res = await lockChannelForDNF(guild, channelId, role.id);
+    if (res.ok) locked += (res.lockedCount || 1);
+    else failed += 1;
+  }
+
+  const extra = panelIds.length
+    ? `\n🔒 Re-applied locks: **${locked}** channel(s)` + (failed ? ` (⚠️ ${failed} failed)` : "")
+    : "\nℹ️ No panel channels are configured yet — run `/dnf_setup`.";
+
+  return interaction.editReply(`✅ Added <@&${role.id}> to ${member}.${extra}`);
+}
+
+if (cmd === "dnf_remove") {
+  const guild = interaction.guild;
+  if (!guild) return interaction.reply({ content: "This command must be used in a server.", ephemeral: true });
+
+  const can =
+    interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) ||
+    interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+
+  if (!can) {
+    return interaction.reply({ content: "You need **Manage Roles** to run this.", ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const cfg = getDNFCfg(guild.id);
+  const roleId = cfg.roleId;
+  if (!roleId) return interaction.editReply("DNF role isn't set up yet. Run `/dnf_setup` in your panel channel.");
+
+  const role = guild.roles.cache.get(roleId) || (await guild.roles.fetch(roleId).catch(() => null));
+  if (!role) return interaction.editReply("I can't find the configured DNF role. Run `/dnf_setup` again.");
+
+  const user = interaction.options.getUser("user", true);
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) return interaction.editReply("I couldn't find that user in this server.");
+
+  await member.roles.remove(role.id).catch((e) => {
+    throw new Error(e?.message || String(e));
+  });
+
+  // Remove member-specific denies now that they are no longer DNF
+  await applyDNFBlocksForMember(guild, member.id, cfg, false);
+
+  return interaction.editReply(`✅ Removed <@&${role.id}> from ${member}.`);
+}
+
 
     // AUTOCLOSE_NOW (manual test)
     // AUTOCLOSE_NOW
@@ -2686,6 +4050,190 @@ if (cmd === "autoopen_now") {
   );
 }
 
+
+
+// GUIDE
+if (cmd === "guide") {
+  const topic = (interaction.options.getString("topic") || "").toLowerCase();
+  const inGuild = Boolean(interaction.guildId);
+
+  const makeEmbed = (title, lines, color = 0x38bdf8) =>
+    new EmbedBuilder()
+      .setColor(color)
+      .setTitle(title)
+      .setDescription(lines.filter(Boolean).join("\n"))
+      .setFooter({ text: "INVINCIBLE EATS — Bot Guide" })
+      .setTimestamp();
+
+  const embeds = [];
+
+  // Overview (always)
+  if (!topic) {
+    embeds.push(
+      makeEmbed("📘 Bot Guide — Overview", [
+        "Use `/help` for a quick list of commands.",
+        "",
+        "**Most used:**",
+        "• **/calc** — customer total calculator (default: cost − fee)",
+        "• **/pay** / **/paycanada** — payment info + buttons",
+        "• **/claim** — rename/claim tickets (server-only)",
+        "• **/vouch** — record vouches + loyalty tiers",
+        "• **/track** — tracker-style embed for DoorDash/Uber Eats links (best-effort)",
+        "",
+        "Tip: In any NEW server, run **/server_setup** so permissions + roles match that server."
+      ])
+    );
+
+    embeds.push(
+      makeEmbed("🧭 Jump to a topic", [
+        "Run: `/guide topic:<topic>`",
+        "",
+        "Topics:",
+        "• Getting Started / Setup",
+        "• Payments",
+        "• Calculator",
+        "• Tickets",
+        "• Vouches",
+        "• Link Tracker"
+      ], 0xa78bfa)
+    );
+
+    return interaction.reply(inGuild ? { embeds, ephemeral: true } : { embeds });
+  }
+
+  if (topic === "setup") {
+    embeds.push(
+      makeEmbed("🛠️ Getting Started / Setup", [
+        "**1) Invite the bot** to your server with the right permissions (Manage Channels recommended).",
+        "",
+        "**2) Configure per-server settings (IMPORTANT)**",
+        "Run `/server_setup` in each server to set:",
+        "• status channel",
+        "• orders channel",
+        "• hero/customer role",
+        "• (optional) announce channel",
+        "• (optional) justice/patrol roles",
+        "",
+        "**3) Ticket config (optional but recommended)**",
+        "Run `/ticket_config` to set a ticket category + prefix so `/closealltickets` works perfectly.",
+        "",
+        "**4) Transcript links (optional)**",
+        "Run `/hosturl_set` to set your public URL (so transcript buttons work outside localhost)."
+      ], 0x22c55e)
+    );
+  }
+
+  if (topic === "payments") {
+    embeds.push(
+      makeEmbed("💸 Payments (/setpay, /pay, /paycanada)", [
+        "**/setpay** (staff/admin): save methods for a staff member",
+        "Format for `methods` (one per line):",
+        "```",
+        "Cash App = $yourtag",
+        "Zelle = email@example.com",
+        "Stripe = https://....",
+        "```",
+        "",
+        "**/pay** — show payment buttons + optional amount/note",
+        "Options:",
+        "• `staff` (optional) — who is getting paid (defaults to you)",
+        "• `staff_id` (optional) — use in DMs if the staff isn’t selectable",
+        "• `amount` (optional) — shows amount",
+        "• `note` (optional)",
+        "• `customer` (optional) — mention/ping a customer (otherwise ticket-opener auto-detects in ticket channels)",
+        "",
+        "**/paycanada** — Canada payment info (Wise/Stripe + crypto options)."
+      ], 0xf59e0b)
+    );
+  }
+
+  if (topic === "calc") {
+    embeds.push(
+      makeEmbed("🧮 Calculator (/calc)", [
+        "Default behavior: **Total Due = cost − fee** (fee defaults to $9).",
+        "",
+        "**Examples:**",
+        "• `/calc cost:12.29` → 12.29 − 9 = **3.29**",
+        "• `/calc cost:12.29 fee:7` → 12.29 − 7 = **5.29**",
+        "",
+        "**Discount options:**",
+        "• `preset_percent` or `percent` applies as **% off cost** and shows **You save**.",
+        "• `customer` lets the bot check that customer’s discount roles (server only).",
+        "",
+        "If your build includes `subtract_fee`, you can force add-fee mode:",
+        "• `/calc cost:12.29 subtract_fee:false` → cost + fee"
+      ], 0x3b82f6)
+    );
+  }
+
+  if (topic === "tickets") {
+    embeds.push(
+      makeEmbed("🎫 Tickets (/claim, /closeticket, /closealltickets)", [
+        "**/claim** — claim + rename a ticket (server-only)",
+        "• `/claim user:@someone`",
+        "• Optional: category/custom naming (if enabled in your build)",
+        "• `/claim unclaim:true` reverts to original name (stored in topic as `Original:`)",
+        "",
+        "**Naming format** (default behavior):",
+        "• INVINCIBLE EATS → `username-invincible-####`",
+        "• Other servers → `username-<server-name>-####`",
+        "",
+        "**/closeticket** — shows buttons (Save+Close w/ transcript OR Delete only)",
+        "**/closealltickets** — bulk close tickets (uses `/ticket_config` for best results)"
+      ], 0xef4444)
+    );
+  }
+
+  if (topic === "vouches") {
+    embeds.push(
+      makeEmbed("✅ Vouches (/vouch, /vouchchecker)", [
+        "**/vouch** — customer submits a vouch for staff",
+        "• Increments vouch counts and updates loyalty tier roles.",
+        "",
+        "**/vouchcount** — shows a user’s vouch count + tier.",
+        "",
+        "**Auto-vouching**",
+        "In channels with “vouch” in the name, the bot can auto-count messages that look like vouches (mentions staff or has attachments).",
+        "",
+        "**/vouchchecker** — scans vouch channels and (optionally) reacts ✅ + updates counts**",
+        "Recommended safe usage:",
+        "• Run without apply first: `/vouchchecker`",
+        "• Then apply safely: `/vouchchecker apply:true sync_roles:true` (upgrade-only)",
+        "• `force:true` allows full rebuild (can lower counts — use carefully)."
+      ], 0x10b981)
+    );
+  }
+
+  if (topic === "track") {
+    embeds.push(
+      makeEmbed("🔎 Link Tracker (/track)", [
+        "**/track url:<link>** posts a tracker-style embed for DoorDash/Uber Eats links (best-effort).",
+        "",
+        "What it can do:",
+        "• Detect link type + extract IDs from URL",
+        "• Pull public page preview metadata when available",
+        "• Add a clean embed + “Open link” button",
+        "",
+        "Limitations:",
+        "• Real-time driver location / live order progress usually requires login or a partner API.",
+        "• This bot does **not** use cookies/auth to scrape private order details."
+      ], 0x64748b)
+    );
+  }
+
+  // Unknown topic fallback
+  if (!embeds.length) {
+    embeds.push(
+      makeEmbed("📘 Bot Guide", [
+        "Unknown topic. Try:",
+        "`/guide` or `/guide topic:Payments` (Setup/Payments/Calc/Tickets/Vouches/Track)."
+      ], 0xa78bfa)
+    );
+  }
+
+  return interaction.reply(inGuild ? { embeds, ephemeral: true } : { embeds });
+}
+
 // HELP
     if (cmd === "help") {
       const e = new EmbedBuilder()
@@ -2694,12 +4242,13 @@ if (cmd === "autoopen_now") {
         .setDescription([
           "**Setup:** /server_setup",
           "**Tickets:** /claim /closeticket /ticket_config /closealltickets",
-          "**Payments:** /setpay /delpay /pay /showpay",
-          "**Orders:** /ueinspect",
-          "**Vouching:** /vouch /vouchcount",
+          "**Payments:** /setpay /delpay /pay /showpay /paycanada",
+          "**Orders:** /ueinspect /track",
+          "**Vouching:** /vouch /vouchcount /vouchchecker",
           "**Moderation:** /scanpromos",
           "**Bump:** /bump_config /bump /bumpstatus",
           "**Utility:** /announce /sayembed /invoice /calc /autoclose_now /autoopen_now",
+          "**Guide:** /guide",
           "**General:** /help"
         ].join("\n"));
 
@@ -2864,9 +4413,36 @@ ${effectiveLine}`)
       });
     }
 
+    // EDITPAY (interactive)
+    if (cmd === "editpay") {
+      const hasJusticeChefRole = interaction.member?.roles?.cache?.has(JUSTICE_CHEF_ROLE_ID);
+      if (!hasJusticeChefRole && !interaction.memberPermissions?.has("ManageGuild")) {
+        return interaction.reply({ content: "You don't have permission to use this command.", ephemeral: true });
+      }
+
+      const staff = interaction.options.getUser("staff", true);
+      const panel = buildEditPayPanel({ guild: interaction.guild, staffId: staff.id });
+      return interaction.reply({ ...panel, ephemeral: true });
+    }
+
+
     // PAY (pings ticket opener)
     if (cmd === "pay") {
-      const staff = interaction.options.getUser("staff", true);
+      // staff is optional; default to the caller (useful in DMs)
+      const staffOpt = interaction.options.getUser("staff");
+      const staffIdRaw = interaction.options.getString("staff_id");
+      let staff = staffOpt;
+
+      // In DMs, Discord only lets you pick users who are in the DM. If you need a different staff member,
+      // use staff_id (User ID) instead.
+      if (!staff && staffIdRaw) {
+        const id = String(staffIdRaw).replace(/[<@!>]/g, "").trim();
+        if (/^\d{17,20}$/.test(id)) {
+          try { staff = await client.users.fetch(id); } catch {}
+        }
+      }
+
+      if (!staff) staff = interaction.user;
       const saved = payStore[staff.id];
 
       if (!saved) {
@@ -2875,33 +4451,51 @@ ${effectiveLine}`)
 
       const amount = interaction.options.getNumber("amount");
       const note = interaction.options.getString("note") || "";
+      const customerOpt = interaction.options.getUser("customer");
       const channel = interaction.channel;
 
-      let openerId = null;
-      if (channel && isTicketChannel(channel.name)) {
+      let openerId = customerOpt?.id || null;
+      if (!openerId && channel && isTicketChannel(channel.name)) {
         const messages = await fetchAllMessages(channel, 200);
         openerId = await findOpener(channel, messages);
       }
 
       const embed = buildPayEmbed(interaction.user, staff, saved, amount ?? null, note, openerId);
-      const components = buildPayButtons(saved);
 
+      // Send first to get a messageId, then attach buttons mapped to THIS message.
       const payload = {
         embeds: [embed],
-        components,
-        ephemeral: false
+        components: [],
+        ephemeral: false,
+        fetchReply: true
       };
 
       if (openerId) {
         payload.content = `<@${openerId}>`;
       }
 
-      return interaction.reply(payload);
-    }
+      const sent = await interaction.reply(payload);
+      const components = buildPayButtons(saved, staff.id);
+      await interaction.editReply({ components });
+      return;
+}
 
     // SHOWPAY
     if (cmd === "showpay") {
-      const staff = interaction.options.getUser("staff", true);
+      const staffOpt = interaction.options.getUser("staff");
+      const staffIdRaw = interaction.options.getString("staff_id");
+      let staff = staffOpt;
+
+      // In DMs, Discord only lets you pick users who are in the DM. If you need a different staff member,
+      // use staff_id (User ID) instead.
+      if (!staff && staffIdRaw) {
+        const id = String(staffIdRaw).replace(/[<@!>]/g, "").trim();
+        if (/^\d{17,20}$/.test(id)) {
+          try { staff = await client.users.fetch(id); } catch {}
+        }
+      }
+
+      if (!staff) staff = interaction.user;
       const saved = payStore[staff.id];
 
       if (!saved) {
@@ -2913,10 +4507,61 @@ ${effectiveLine}`)
 
       const note = interaction.options.getString("note") || "";
       const embed = buildPayEmbed(interaction.user, staff, saved, null, note, null);
-      const components = buildPayButtons(saved);
 
-      return interaction.reply({ embeds: [embed], components, ephemeral: false });
+      // Send first to get a messageId, then attach buttons mapped to THIS message.
+      const sent = await interaction.reply({
+        embeds: [embed],
+        components: [],
+        ephemeral: false,
+        fetchReply: true
+      });
+
+      const components = buildPayButtons(saved, staff.id);
+      await interaction.editReply({ components });
+      return;
     }
+
+
+    // PAYCANADA (Wise + Stripe + optional crypto preference)
+    if (cmd === "paycanada") {
+      const customer = interaction.options.getUser("customer");
+      const amount = interaction.options.getNumber("amount");
+      const crypto = interaction.options.getString("crypto");
+      const noteRaw = interaction.options.getString("note") || "";
+
+      const embed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle("🇨🇦 Canada Payment")
+        .setDescription(
+          `**Wise:** ${CANADA_WISE_URL}\n` +
+          `**Stripe:** ${CANADA_STRIPE_URL}\n\n` +
+          `**${CANADA_STRIPE_NOTE}**\n\n` +
+          `**Crypto options:** ETH, LTC, USDT`
+        )
+        .setFooter({ text: `Requested by ${interaction.user.tag}` })
+        .setTimestamp();
+
+      if (customer) embed.addFields({ name: "Customer", value: `<@${customer.id}>`, inline: true });
+      if (amount != null) embed.addFields({ name: "Amount (CAD)", value: fmtMoneyCAD(amount), inline: true });
+      if (crypto) embed.addFields({ name: "Crypto (optional)", value: `**${crypto}**`, inline: true });
+      if (noteRaw) embed.addFields({ name: "Note", value: noteRaw, inline: false });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel("Pay with Wise")
+          .setStyle(ButtonStyle.Link)
+          .setURL(CANADA_WISE_URL),
+        new ButtonBuilder()
+          .setLabel("Pay with Stripe")
+          .setStyle(ButtonStyle.Link)
+          .setURL(CANADA_STRIPE_URL)
+      );
+
+      // Public reply so the customer can see the links; ping if provided.
+      const content = customer ? `<@${customer.id}>` : null;
+      return interaction.reply({ content, embeds: [embed], components: [row], ephemeral: false });
+    }
+
 
     // BUMP CONFIG
     if (cmd === "bump_config") {
@@ -3005,7 +4650,8 @@ ${effectiveLine}`)
     // SERVER_SETUP (multi-server)
     if (cmd === "server_setup") {
       const statusCh = interaction.options.getChannel("status_channel", true);
-      const ordersCh = interaction.options.getChannel("orders_channel", true);
+      // Option name in the builder is "order_channel" (not "orders_channel")
+      const ordersCh = interaction.options.getChannel("order_channel", true);
       const heroRole = interaction.options.getRole("hero_role", true);
 
       // Prevent misconfig: @everyone as hero role will make Orders visible to everyone when opened.
@@ -3199,7 +4845,7 @@ ${effectiveLine}`)
       // Apply customer tier roles (upgrade only)
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (member) {
-        await syncCustomerTierRoles(interaction.guild, member, newCustCount);
+        await syncCustomerTierRolesUpgradeOnly(interaction.guild, member, newCustCount);
       }
 
       return interaction.reply({
@@ -3278,6 +4924,266 @@ ${effectiveLine}`)
         ephemeral: true
       });
     }
+// VOUCHCHECKER (scan posted vouches + optional ✅ reaction + optional safe rebuild)
+if (cmd === "vouchchecker") {
+      const guild = interaction.guild;
+      if (!guild) {
+        return interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+      }
+
+      // Options
+      const channelOpt = interaction.options.getChannel("channel");
+      const scanAll = interaction.options.getBoolean("all_channels") ?? false;
+      const limit = interaction.options.getInteger("limit") || 3000; // per channel
+      const doReact = interaction.options.getBoolean("react") ?? true;
+      const apply = interaction.options.getBoolean("apply") ?? true;
+      const force = interaction.options.getBoolean("force") ?? false; // true = overwrite JSON + strict role sync (can downgrade)
+
+      await interaction.deferReply({ ephemeral: true });
+
+      // Build channel list
+      await guild.channels.fetch().catch(() => {});
+      const EXTRA_VOUCH_CHANNEL_NAMES = new Set([
+        "food-vouches",
+        "subscription-other-vouches",
+        "meal-kits-vouches"
+      ]);
+
+      let channelsToScan = [];
+      if (scanAll || !channelOpt) {
+        channelsToScan = [...guild.channels.cache.values()].filter(ch => {
+          if (!ch) return false;
+          if (!(ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement)) return false;
+          const name = String(ch.name || "").toLowerCase();
+          return isLikelyVouchChannel(ch) || EXTRA_VOUCH_CHANNEL_NAMES.has(name);
+        });
+
+        // Fallback: at least scan the current channel if it is text-based
+        if (!channelsToScan.length && interaction.channel?.isTextBased?.()) {
+          channelsToScan = [interaction.channel];
+        }
+      } else {
+        channelsToScan = [channelOpt];
+      }
+
+      if (!channelsToScan.length) {
+        return safeEditReply(interaction, "No vouch channels found to scan.");
+      }
+
+      // Helpers
+      const isStaffId = (id) => {
+        if (!id) return false;
+        // Quick check based on known staff role IDs (guild-specific staff isn't stored, but this is your server's staff list)
+        // In other servers, staff counting still works when a staff member is mentioned AND they have one of the STAFF_ROLE_IDS.
+        return true;
+      };
+
+      function isStaffMember(member) {
+        return member?.roles?.cache?.some(r => STAFF_ROLE_IDS.includes(r.id));
+      }
+
+      // Parse vouch from a raw message
+      async function detectVouchFromMessage(ch, msg) {
+        try {
+          // 1) /vouch embed created by THIS bot
+          if (msg.author?.bot && msg.embeds?.length) {
+            const e = msg.embeds[0];
+            const title = String(e.title || "").toLowerCase();
+            if (title.includes("new vouch")) {
+              const fields = e.fields || [];
+              const custField = fields.find(f => String(f.name || "").toLowerCase().includes("customer"));
+              const staffField = fields.find(f => String(f.name || "").toLowerCase().includes("served by"));
+              const custId = custField?.value?.match(/<@!?(\d+)>/)?.[1] || null;
+              const staffId = staffField?.value?.match(/<@!?(\d+)>/)?.[1] || null;
+              if (custId) return { customerId: custId, staffId };
+            }
+          }
+
+          // 2) Manual vouch message in a vouch channel
+          if (msg.author?.bot) return null;
+
+          const content = String(msg.content || "");
+          const lower = content.toLowerCase();
+
+          const hasAttachment = (msg.attachments?.size || 0) > 0;
+          const hasVouchWord =
+            /\bvouch(ed|ing)?\b/i.test(content) ||
+            /\b\+1\b/.test(content) ||
+            /\brep\b/i.test(content) ||
+            /\btrusted\b/i.test(content) ||
+            /\blegit\b/i.test(content);
+
+          // Require *something* that signals a vouch: attachment or vouch-ish words
+          if (!hasAttachment && !hasVouchWord) return null;
+
+          // Staff mention is best for staff credit, but not required to count the customer vouch.
+          let staffId = msg.mentions?.users?.first()?.id || null;
+
+          // If the mentioned user isn't staff in THIS guild, drop staff credit (still count customer).
+          if (staffId) {
+            const staffMember = await ch.guild.members.fetch(staffId).catch(() => null);
+            if (!isStaffMember(staffMember)) staffId = null;
+          }
+
+          return { customerId: msg.author.id, staffId };
+        } catch {
+          return null;
+        }
+      }
+
+      // Scan channels
+      const staffCounts = {};
+      const custCounts = {};
+      const perChannelStats = [];
+
+      let totalScanned = 0;
+      let totalFound = 0;
+      let totalReactionsAdded = 0;
+
+      for (const ch of channelsToScan) {
+        if (!ch?.isTextBased?.()) continue;
+
+        let scannedHere = 0;
+        let foundHere = 0;
+        let reactedHere = 0;
+
+        // Permission check for reacting
+        const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+        const perms = me ? ch.permissionsFor(me) : null;
+        const canReadHistory = perms?.has(PermissionFlagsBits.ReadMessageHistory) ?? true;
+        const canAddReactions = perms?.has(PermissionFlagsBits.AddReactions) ?? true;
+
+        if (!canReadHistory) {
+          perChannelStats.push({ id: ch.id, name: ch.name, scanned: 0, found: 0, reacted: 0, skipped: "No ReadMessageHistory" });
+          continue;
+        }
+
+        let fetched = null;
+        try {
+          fetched = await ch.messages.fetch({ limit: Math.min(100, limit) });
+        } catch {
+          perChannelStats.push({ id: ch.id, name: ch.name, scanned: 0, found: 0, reacted: 0, skipped: "Cannot fetch messages" });
+          continue;
+        }
+
+        let lastId = fetched?.last()?.id;
+        let messages = fetched ? [...fetched.values()] : [];
+
+        while (messages.length < limit && fetched && fetched.size === 100) {
+          fetched = await ch.messages.fetch({ limit: 100, before: lastId }).catch(() => null);
+          if (!fetched || fetched.size === 0) break;
+          messages.push(...fetched.values());
+          lastId = fetched.last().id;
+          if (messages.length >= limit) break;
+        }
+
+        messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+        for (const msg of messages) {
+          scannedHere++;
+          totalScanned++;
+
+          const v = await detectVouchFromMessage(ch, msg);
+          if (!v) continue;
+
+          foundHere++;
+          totalFound++;
+
+          // Count customer
+          custCounts[v.customerId] = (custCounts[v.customerId] || 0) + 1;
+
+          // Count staff if present
+          if (v.staffId) {
+            staffCounts[v.staffId] = (staffCounts[v.staffId] || 0) + 1;
+          }
+
+          // React with ✅ (only if requested, and only if bot can react)
+          if (doReact && canAddReactions) {
+            const already = msg.reactions?.cache?.find(r => r.emoji?.name === "✅");
+            const meReacted = already?.me === true;
+            if (!meReacted) {
+              try {
+                await msg.react("✅");
+                reactedHere++;
+                totalReactionsAdded++;
+              } catch {
+                // ignore
+              }
+            }
+          }
+        }
+
+        perChannelStats.push({ id: ch.id, name: ch.name, scanned: scannedHere, found: foundHere, reacted: reactedHere, skipped: null });
+        // tiny delay to avoid rate limits when scanning multiple channels
+        await sleep(450);
+      }
+
+      // Apply to stores + roles
+      let savedCustomers = 0;
+      let savedStaff = 0;
+
+      if (apply) {
+        // Merge counts to avoid accidental downgrades from missing JSON data.
+        for (const [sid, c] of Object.entries(staffCounts)) {
+          savedStaff++;
+          const prev = vouchByStaff[sid] || 0;
+          vouchByStaff[sid] = force ? c : Math.max(prev, c);
+        }
+
+        for (const [cid, c] of Object.entries(custCounts)) {
+          savedCustomers++;
+          const prev = vouchByCust[cid] || 0;
+          vouchByCust[cid] = force ? c : Math.max(prev, c);
+        }
+
+        writeJson("vouches_by_staff.json", vouchByStaff);
+        writeJson("vouches_by_customer.json", vouchByCust);
+
+        // Sync roles (force can downgrade; normal mode only upgrades)
+        for (const [cid, count] of Object.entries(custCounts)) {
+          const member = await guild.members.fetch(cid).catch(() => null);
+          if (!member) continue;
+
+          const finalCount = vouchByCust[cid] || count || 0;
+          if (force) {
+            await syncCustomerTierRoles(guild, member, finalCount).catch(() => {});
+          } else {
+            await syncCustomerTierRolesUpgradeOnly(guild, member, finalCount).catch(() => {});
+          }
+        }
+      }
+
+      // Build summary embed
+      const lines = [];
+      const shown = perChannelStats.slice(0, 10); // avoid huge embeds
+      for (const s of shown) {
+        const base = `<#${s.id}> — scanned **${s.scanned}**, found **${s.found}**` + (doReact ? `, ✅ **${s.reacted}**` : "");
+        lines.push(s.skipped ? `${base} *(skipped: ${s.skipped})*` : base);
+      }
+      if (perChannelStats.length > shown.length) {
+        lines.push(`…and **${perChannelStats.length - shown.length}** more channel(s).`);
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0x22c55e)
+        .setTitle("✅ Vouch Checker")
+        .setDescription(
+          [
+            `**Channels scanned:** ${perChannelStats.length}`,
+            `**Messages scanned:** ${totalScanned}`,
+            `**Vouches detected:** ${totalFound}`,
+            doReact ? `**Reactions added:** ${totalReactionsAdded}` : null,
+            apply ? `**Saved:** customers=${savedCustomers}, staff=${savedStaff} ${force ? "(FORCE overwrite)" : "(safe merge)"}` : "**Saved:** No (apply=false)",
+            "",
+            "**Per-channel:**",
+            lines.join("\n")
+          ].filter(Boolean).join("\n")
+        )
+        .setTimestamp();
+
+      return safeEditReply(interaction, { embeds: [embed] });
+    }
+
 
     // ANNOUNCE
     if (cmd === "announce") {
@@ -3308,91 +5214,230 @@ ${effectiveLine}`)
     }
 
 
-    // CALC
-    if (cmd === "calc") {
-      const cfg = getServerCfg(interaction.guildId);
-      const member = interaction.member;
-      const calcRoleId = cfg.calcRoleId || cfg.justiceChefRoleId || JUSTICE_CHEF_ROLE_ID;
-      // Access: configured calc role (defaults to Justice Chef). Keep Administrator as emergency override.
-      const allowed =
-        (calcRoleId ? member?.roles?.cache?.has(calcRoleId) : false) ||
-        member?.permissions?.has(PermissionFlagsBits.ManageGuild) ||
-        member?.permissions?.has(PermissionFlagsBits.Administrator);
 
-      if (!allowed) {
-        return interaction.reply({
-          content: calcRoleId
-            ? `Only <@&${calcRoleId}> (or Manage Server) can use /calc.`
-            : "Only Manage Server can use /calc.",
-          ephemeral: true
-        });
-      }
+// CALC
+if (cmd === "calc") {
+  const cost = interaction.options.getNumber("cost", true);
+  const feeInput = interaction.options.getNumber("fee"); // optional
+  const subtractFee = interaction.options.getBoolean("subtract_fee") ?? false; // Default OFF (we ADD fee)
+  const presetPercent = interaction.options.getNumber("preset_percent"); // optional
+  const percent = interaction.options.getNumber("percent"); // optional
+  const percentTable = interaction.options.getString("percent_table"); // optional
+  const customerUser = interaction.options.getUser("customer") ?? interaction.user;
+  const isPublic = interaction.options.getBoolean("public") ?? false;
 
-    const cost = interaction.options.getNumber("cost", true);
-      const feeOpt = interaction.options.getNumber("fee");
-      const publicFlag = interaction.options.getBoolean("public") || false;
-      const explicitCustomer = interaction.options.getUser("customer");
+  if (!interaction.inGuild() || !interaction.guild) {
+    return interaction.reply({
+      content: "⚠️ `/calc` must be used inside a server so I can check roles.",
+      ephemeral: true,
+    });
+  }
 
-      const baseFee = feeOpt != null ? feeOpt : DEFAULT_SERVICE_FEE;
+  const guild = interaction.guild;
+  await interaction.deferReply({ ephemeral: !isPublic });
 
-      // Determine which customer we should apply discount roles for:
-      // 1) explicit customer option
-      // 2) ticket opener (if in a ticket channel)
-      // 3) command invoker
-      let customerMember = null;
+  // ---- Helpers: role detection that works even when interaction.member is "partial"
+  const norm = (s) => {
+    // Normalize role names so checks work even if roles include emojis or punctuation.
+    // Examples:
+    //  - "VILTRUMITE 💥" -> "viltrumite"
+    //  - "20% OFF- REMOVE AFTER USE" -> "20% off remove after use"
+    const str = String(s ?? "").trim().toLowerCase();
+    // Remove common emoji blocks + symbols, then collapse remaining non-letters/numbers/% into spaces.
+    return str
+      .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
+      .replace(/[^\p{L}\p{N}%]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
 
-      if (explicitCustomer) {
-        customerMember = await interaction.guild.members.fetch(explicitCustomer.id).catch(() => null);
-      } else if (interaction.channel && isTicketChannel(interaction.channel.name)) {
-        const msgs = await fetchAllMessages(interaction.channel, 200).catch(() => []);
-        const openerId = await findOpener(interaction.channel, msgs).catch(() => null);
-        if (openerId) {
-          customerMember = await interaction.guild.members.fetch(openerId).catch(() => null);
-        }
-      }
+  const getRoleIdsFromMember = (m) => {
+    if (!m) return [];
+    // APIInteractionGuildMember has roles: string[]
+    if (Array.isArray(m.roles)) return m.roles;
+    // GuildMember has roles as RoleManager
+    if (m.roles?.cache) return Array.from(m.roles.cache.keys());
+    // Some environments expose _roles
+    if (Array.isArray(m._roles)) return m._roles;
+    return [];
+  };
 
-      if (!customerMember) {
-        customerMember = interaction.member;
-      }
+  const getRoleNamesFromIds = (ids) =>
+    ids
+      .map((id) => guild.roles.cache.get(id)?.name)
+      .filter(Boolean);
 
-      const discount = getBestFeeDiscountForMember(customerMember);
-      const feeAfter = Math.max(0, baseFee - (discount.amount || 0));
-      const total = (cost || 0) + feeAfter;
+  const getAllRoleNames = (m) => {
+    if (!m) return [];
+    if (m.roles?.cache) return m.roles.cache.map((r) => r.name);
+    return getRoleNamesFromIds(getRoleIdsFromMember(m));
+  };
 
-      const discountLine = discount.label
-        ? `${discount.label} (−${fmtMoney(discount.amount)} fee)`
-        : "None";
+  const hasAnyRoleName = (m, names) => {
+    const roleNameSet = new Set(getAllRoleNames(m).map(norm));
+    return names.some((n) => roleNameSet.has(norm(n)));
+  };
 
-      const e = new EmbedBuilder()
-        .setColor(0x22c55e)
-        .setTitle("🧮 Payment Breakdown")
-        .addFields(
-          { name: "Customer", value: customerMember ? `${customerMember}` : `${interaction.user}`, inline: true },
-          { name: "Cost to us", value: fmtMoney(cost), inline: true },
-          { name: "Base fee", value: fmtMoney(baseFee), inline: true },
-          { name: "Discount role", value: discountLine, inline: true },
-          { name: "Final fee", value: fmtMoney(feeAfter), inline: true },
-          { name: "Customer pays", value: `**${fmtMoney(total)}**`, inline: true }
-        )
-        .setTimestamp();
+  // Fetch the target member if we can (helps for removing one-time roles).
+  let customerMember = null;
+  if (customerUser.id === interaction.user.id && interaction.member) {
+    customerMember = interaction.member; // can be GuildMember or APIInteractionGuildMember
+  } else {
+    customerMember = await guild.members.fetch(customerUser.id).catch(() => null);
+  }
 
-      const cents = Math.round(total * 100);
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`calc:copy_total:${cents}`)
-          .setStyle(ButtonStyle.Primary)
-          .setLabel("Copy total")
-      );
+  // If the command targets a different user but we can't resolve them as a guild member,
+  // don't silently fall back to the invoker (that makes role checks look "broken").
+  if (customerUser.id !== interaction.user.id && !customerMember) {
+    await interaction.editReply({
+      content:
+        `I couldn't fetch **${customerUser.tag}** as a server member, so I can't read their roles.\n\n` +
+        `**Fix checklist:**\n` +
+        `• Make sure that user is actually in this server\n` +
+        `• In Discord Developer Portal → Bot → Privileged Gateway Intents: enable **Server Members Intent**\n` +
+        `• Restart the bot after enabling it\n`,
+    });
+    return;
+  }
 
-      return interaction.reply({
-        embeds: [e],
-        components: [row],
-        ephemeral: !publicFlag
-      });
+  const memberForRoles = customerMember ?? interaction.member;
+
+  const roleNames = (memberForRoles?.roles?.cache ? [...memberForRoles.roles.cache.values()].map(r => r.name) : []);
+  const roleNamesLower = new Set(roleNames.map(n => String(n).trim().toLowerCase()));
+  // ---- One-time roles (exact names)
+  // Use role **IDs** for reliable detection (names can contain emojis/case/spacing changes).
+  // Provided by you:
+  //   VILTRUMITE = 1394179600187261058
+  //   ORDER AT COST- REMOVE AFTER USE = 1386924124433023062
+  //   20% OFF- REMOVE AFTER USE = 1386924124433023063
+  const ROLE_20_OFF_ONETIME_ID = "1386924124433023063";
+  const ROLE_ORDER_AT_COST_ONETIME_ID = "1386924124433023062";
+  const ROLE_VILTRUMITE_ID = "1394179600187261058";
+
+  const ROLE_20_OFF_ONETIME = "20% OFF- REMOVE AFTER USE";
+  const ROLE_ORDER_AT_COST_ONETIME = "ORDER AT COST- REMOVE AFTER USE";
+
+  // ---- Discounts
+  // (A) Manual promo first (percent_table/preset_percent/percent)
+  // (B) Then role adjustments after manual promo
+  const VILTRUMITE_DISCOUNT = 0.20;
+
+  const memberRoleIds = getRoleIdsFromMember(memberForRoles);
+  const hasOneTime20Off = memberRoleIds.includes(ROLE_20_OFF_ONETIME_ID);
+  const hasOrderAtCost = memberRoleIds.includes(ROLE_ORDER_AT_COST_ONETIME_ID);
+  const hasViltrumite = memberRoleIds.includes(ROLE_VILTRUMITE_ID);
+
+  // Resolve service fee (default $9)
+  const feeForMath = typeof feeInput === "number" ? feeInput : DEFAULT_SERVICE_FEE;
+
+  // 1) Start with base cost
+  let base = cost;
+
+  // 2) Manual promo percent
+  let manualPercentOff = 0;
+
+  if (typeof percent === "number") {
+    manualPercentOff = percent;
+  } else if (typeof presetPercent === "number") {
+    manualPercentOff = presetPercent;
+  } else if (typeof percentTable === "string" && percentTable.trim()) {
+    const cleaned = percentTable.replace(/%/g, "").trim();
+    const num = Number(cleaned);
+    if (!Number.isNaN(num) && num >= 0) manualPercentOff = num;
+  }
+
+  if (manualPercentOff > 0) {
+    const p = Math.min(Math.max(manualPercentOff, 0), 100) / 100;
+    base = base * (1 - p);
+  }
+
+  // 3) Role-based adjustments AFTER manual promo
+  let roleDiscountLabel = "";
+  let rolePercentOff = 0;
+
+  if (hasOrderAtCost) {
+    roleDiscountLabel = ROLE_ORDER_AT_COST_ONETIME;
+    rolePercentOff = 0;
+  } else if (hasOneTime20Off) {
+    roleDiscountLabel = ROLE_20_OFF_ONETIME;
+    rolePercentOff = 0.20;
+  } else if (hasViltrumite) {
+    roleDiscountLabel = "Viltrumite";
+    rolePercentOff = VILTRUMITE_DISCOUNT;
+  }
+
+  if (!hasOrderAtCost && rolePercentOff > 0) {
+    base = base * (1 - rolePercentOff);
+  }
+
+  // Order-at-cost waives fee
+  const finalFee = hasOrderAtCost ? 0 : feeForMath;
+
+  // 4) Total: default ADD fee
+  const total = subtractFee ? base - finalFee : base + finalFee;
+
+  // ---- Response
+  const lines = [];
+  lines.push(`Cost: **${fmtMoney(cost)}**`);
+
+  if (manualPercentOff > 0) {
+    lines.push(`Manual promo: **-${manualPercentOff}%**`);
+  }
+
+  if (roleDiscountLabel) {
+    if (hasOrderAtCost) {
+      lines.push(`Role applied: **${roleDiscountLabel}** (fee waived)`);
+    } else {
+      lines.push(`Role applied: **${roleDiscountLabel}** (${Math.round(rolePercentOff * 100)}% off)`);
     }
+  }
 
-    // INVOICE
-    if (cmd === "invoice") {
+  lines.push(subtractFee ? `Fee: **-${fmtMoney(finalFee)}** (subtract_fee ON)` : `Fee: **+${fmtMoney(finalFee)}**`);
+  lines.push(`Total: **${fmtMoney(total)}**`);
+
+    const header = isPublic ? "" : `For: <@${customerUser.id}>\n`;
+    const debug = [];
+    if (!isPublic) {
+      debug.push(
+        `Role checks: Viltrumite ${hasViltrumite ? "✅" : "❌"} | 20% OFF role ${hasOneTime20Off ? "✅" : "❌"} | Order-at-cost role ${hasOrderAtCost ? "✅" : "❌"}`
+      );
+      if (roleNames?.length) {
+        const shown = roleNames.slice(0, 20).join(", ");
+        debug.push(`Roles seen (${roleNames.length}): ${shown}${roleNames.length > 20 ? " …" : ""}`);
+      } else {
+        debug.push(`Roles seen: (none / unable to resolve)`);
+      }
+    }
+    const content = `${header}${debug.length ? debug.join("\n") + "\n\n" : ""}${lines.join("\n")}`;
+
+  await interaction.editReply({ content });
+
+  // ---- Remove one-time roles after use (best-effort)
+  const removeRoleById = async (roleId) => {
+    try {
+      if (!roleId) return;
+      const role = guild.roles.cache.get(roleId) ?? (await guild.roles.fetch(roleId).catch(() => null));
+      if (!role) return;
+
+      const gm =
+        customerMember && customerMember.roles?.cache
+          ? customerMember
+          : await guild.members.fetch(customerUser.id).catch(() => null);
+
+      if (!gm || !gm.roles?.remove) return;
+      if (!gm.roles.cache.has(role.id)) return;
+
+      await gm.roles.remove(role, "Auto-remove one-time promo role after /calc");
+    } catch (_) {}
+  };
+
+  if (hasOneTime20Off) await removeRoleById(ROLE_20_OFF_ONETIME_ID);
+  if (hasOrderAtCost) await removeRoleById(ROLE_ORDER_AT_COST_ONETIME_ID);
+
+  return;
+}
+
+if (cmd === "invoice") {
       const customer = interaction.options.getUser("customer", true);
       const amount = interaction.options.getNumber("amount", true);
       const items = interaction.options.getString("items", true);
@@ -3443,6 +5488,27 @@ ${effectiveLine}`)
       return interaction.reply({ content: "Forwarded to the tickets channel!", ephemeral: true });
     }
 
+      // TRACK (best-effort order link preview)
+      if (cmd === "track") {
+        const url = interaction.options.getString("url", true);
+        const makePublic = interaction.options.getBoolean("public") ?? false;
+
+        let info;
+        try {
+          info = classifyTrackingUrl(url);
+        } catch (e) {
+          return interaction.reply({ content: "That doesn't look like a valid URL.", ephemeral: true });
+        }
+
+        const og = await fetchOGMeta(url);
+        const embed = buildTrackingEmbed(url, info, og, interaction.user);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel("Open link")
+        );
+
+        return interaction.reply({ embeds: [embed], components: [row], ephemeral: !makePublic });
+      }
+
     // CLOSETICKET
     if (cmd === "closeticket") {
       const can = interaction.member.permissions.has(PermissionFlagsBits.ManageChannels);
@@ -3475,29 +5541,55 @@ ${effectiveLine}`)
       return interaction.reply({ embeds: [embed], components: row ? [row] : [], ephemeral: true });
     }
 
-    // CLAIM (and UNCLAIM)
-    if (cmd === "claim") {
+if (cmd === "claim") {
+      const guild = interaction.guild;
+      const channel = interaction.channel;
+
+      if (!guild || !channel) {
+        return interaction.reply({ content: "Guild/channel not found."});
+      }
+
+      // Defer immediately so Discord never shows "interaction failed"
+      // (channel edits / API fetches can take > 3s).
+      await interaction.deferReply({ ephemeral: true });
+
+
+      // Staff permission: Manage Channels / Admin OR the server's configured Justice role
+      const cfg = getServerCfg(interaction.guildId);
+      const staffRoleId = cfg?.justiceChefRoleId || JUSTICE_CHEF_ROLE_ID;
+
       const member = interaction.member;
       const allowed =
-        member.permissions.has(PermissionFlagsBits.ManageChannels) ||
-        member.roles.cache.has(JUSTICE_CHEF_ROLE_ID);
+        member?.permissions?.has(PermissionFlagsBits.ManageChannels) ||
+        member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+        member?.roles?.cache?.has(staffRoleId);
 
       if (!allowed) {
-        return interaction.reply({
-          content: "You need **Manage Channels** or **Justice Chef on patrol**.",
-          ephemeral: true
-        });
+        return interaction.editReply({
+          content: `You need **Manage Channels**, **Administrator**, or the configured staff role: <@&${staffRoleId}>.`});
       }
 
-      const channel = interaction.channel;
-      if (!channel || !isTicketChannel(channel.name)) {
-        return interaction.reply({
-          content: "This command can only be used in a ticket channel.",
-          ephemeral: true
-        });
+      // Bot permission check (so you get a REAL error instead of "it didn't work")
+      const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+      const botPerms = me ? channel.permissionsFor(me) : null;
+
+      if (!botPerms?.has(PermissionFlagsBits.ManageChannels)) {
+        return interaction.editReply({
+          content: "❌ I can't rename this channel because I'm missing **Manage Channels** permission here."});
       }
 
-      const doUnclaim = interaction.options.getBoolean("unclaim") || false;
+      // Only allow in ticket-ish channels (ticket-#### or anything ending in -####)
+      if (!isTicketChannel(channel.name)) {
+        return interaction.editReply({
+          content: "This command can only be used in a ticket channel (ex: `ticket-1234`)."});
+      }
+
+      // Defer so channel edits never time out
+const doUnclaim = interaction.options.getBoolean("unclaim") || false;
+
+      // Optional category for naming
+      const category = interaction.options.getString("category");
+      const customCategory = interaction.options.getString("custom") || "";
 
       // ----- UNCLAIM -----
       if (doUnclaim) {
@@ -3512,10 +5604,8 @@ ${effectiveLine}`)
         try {
           await channel.edit({ name: originalName });
         } catch (e) {
-          return interaction.reply({
-            content: "Unclaim failed — check channel permissions.",
-            ephemeral: true
-          });
+          return interaction.editReply({
+            content: "Unclaim failed — check channel permissions."});
         }
 
         const e = new EmbedBuilder()
@@ -3524,23 +5614,52 @@ ${effectiveLine}`)
           .setDescription(`Reverted channel name back to: \`${originalName}\``)
           .setTimestamp();
 
-        return interaction.reply({ embeds: [e], ephemeral: true });
+        return interaction.editReply({ embeds: [e]});
       }
 
       // ----- CLAIM -----
       const targetUser = interaction.options.getUser("user");
       if (!targetUser) {
-        return interaction.reply({
-          content: "Pick a **user** to claim this ticket for, or run **/claim unclaim:true** to revert.",
-          ephemeral: true
-        });
+        return interaction.editReply({
+          content: "Pick a **user** to claim this ticket for, or run **/claim unclaim:true** to revert."});
       }
 
       const ticketNumber = extractTicketNumberFromChannel(channel.name) || "0000";
 
-      const original = `ticket-${ticketNumber}`;
-      const userSlug = slugifyUsername(targetUser.username);
-      const newName = `${userSlug}-invincible-${ticketNumber}`;
+      // Determine the "middle" segment:
+      // - If a category was provided (UE/DD/Custom), use that.
+      // - Otherwise, use the server name (INVINCIBLE EATS -> invincible).
+      let mid = "";
+      if (category === "ue") mid = "ue";
+      else if (category === "dd") mid = "dd";
+      else if (category === "custom") {
+        if (!customCategory.trim()) {
+          return interaction.editReply({
+            content: "If you pick **Custom**, you must enter the `custom` text too."});
+        }
+        mid = slugifyUsername(customCategory);
+      } else {
+        const gname = String(interaction.guild?.name || "server");
+        mid = /invincible/i.test(gname) ? "invincible" : slugifyUsername(gname);
+      }
+
+      // Original channel name (used for /claim unclaim:true)
+      // If the topic already contains "Original:", keep that (so multiple claims don't overwrite it).
+      const topicNow = channel.topic || "";
+      const existingOriginal = (topicNow.match(/Original:\s*([^\s|]+)/i) || [])[1] || null;
+      const original = existingOriginal || channel.name;
+
+      // New name: <user>-<mid>-####
+      let userSlug = slugifyUsername(targetUser.username);
+      let newName = `${userSlug}-${mid}-${ticketNumber}`;
+
+      // Discord channel name max length is 100. If we overflow, trim the username portion.
+      if (newName.length > 100) {
+        const extra = newName.length - 100;
+        userSlug = userSlug.slice(0, Math.max(3, userSlug.length - extra));
+        newName = `${userSlug}-${mid}-${ticketNumber}`;
+        newName = newName.slice(0, 100);
+      }
 
       const newTopic =
         channel.topic && channel.topic.toLowerCase().includes("original:")
@@ -3550,10 +5669,8 @@ ${effectiveLine}`)
       try {
         await channel.edit({ name: newName, topic: newTopic });
       } catch (e) {
-        return interaction.reply({
-          content: "Rename failed — check channel permissions.",
-          ephemeral: true
-        });
+        return interaction.editReply({
+          content: "Rename failed — check channel permissions."});
       }
 
       const e = new EmbedBuilder()
@@ -3566,7 +5683,7 @@ ${effectiveLine}`)
         )
         .setTimestamp();
 
-      return interaction.reply({ embeds: [e], ephemeral: true });
+      return interaction.editReply({ embeds: [e]});
     }
 
   } catch (err) {
@@ -3623,8 +5740,44 @@ app.listen(PORT, () => console.log(`🌐 Transcript host running on port ${PORT}
 // READY + LOGIN
 // ============================================
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  // Register GUILD commands for every server this bot is in.
+  // This is what makes /claim (and the other server-only commands) show up quickly in ALL servers.
+  // (Global command propagation can take a while.)
+  try {
+    await registerGuildCommandsForAllGuilds(client);
+  } catch (e) {
+    console.log("Guild command registration (ready) failed:", e?.message || e);
+  }
+
+// Re-apply DNF locks on startup (useful if you configured DNF on an older build)
+try {
+  for (const [guildId, guild] of client.guilds.cache) {
+    const cfg = getDNFCfg(guildId);
+    if (!cfg?.roleId || !cfg?.panelChannelIds?.length) continue;
+
+    const role =
+      guild.roles.cache.get(cfg.roleId) ||
+      (await guild.roles.fetch(cfg.roleId).catch(() => null));
+    if (!role) continue;
+
+    for (const chId of cfg.panelChannelIds) {
+      const channel =
+        guild.channels.cache.get(chId) ||
+        (await guild.channels.fetch(chId).catch(() => null));
+      if (!channel) continue;
+
+      await lockChannelForDNF(channel, role, { hide: true, lockHistory: true });
+    }
+  }
+  console.log("[DNF] Startup re-apply complete.");
+    await reapplyDNFMemberBlocksOnStartup();
+} catch (e) {
+  console.log("[DNF] Startup re-apply failed:", e?.message || e);
+}
+
 
   // Start bump timers (based on lastBumpTs so restarts are accurate)
   for (const guildId of Object.keys(bumpStore)) {
@@ -3651,6 +5804,26 @@ client.once("ready", () => {
   } catch (err) {
     console.log("Command registration failed:", err.message);
   }
+
+
+// Keep member-specific DNF blocks in sync even if roles are added/removed manually.
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  try {
+    const cfg = getDNFCfg(newMember.guild.id);
+    if (!cfg?.roleId || !cfg?.panelChannelIds?.length) return;
+
+    const had = oldMember.roles.cache.has(cfg.roleId);
+    const has = newMember.roles.cache.has(cfg.roleId);
+
+    if (!had && has) {
+      await applyDNFBlocksForMember(newMember.guild, newMember.id, cfg, true);
+    } else if (had && !has) {
+      await applyDNFBlocksForMember(newMember.guild, newMember.id, cfg, false);
+    }
+  } catch (e) {
+    console.warn("[DNF] guildMemberUpdate sync failed:", e?.message || e);
+  }
+});
 
   client.login(process.env.DISCORD_TOKEN);
 })();
