@@ -3345,8 +3345,8 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
-      // /editpay modal submit
-      if (interaction.customId.startsWith("payedit:modal:")) {
+      // /editpay modal submit (disabled - replaced by newer payedit flow)
+      if (false && interaction.customId.startsWith("payedit:modal:")) {
         const parts = interaction.customId.split(":");
         // payedit:modal:<staffId>
         const staffId = parts[2];
@@ -4420,8 +4420,8 @@ ${effectiveLine}`)
         return interaction.reply({ content: "You don't have permission to use this command.", ephemeral: true });
       }
 
-      const staff = interaction.options.getUser("staff", true);
-      const panel = buildEditPayPanel({ guild: interaction.guild, staffId: staff.id });
+      const staff = interaction.options.getUser("staff") || interaction.options.getUser("user") || interaction.user;
+      const panel = await buildEditPayPanel({ guild: interaction.guild, staffId: staff.id, editorId: interaction.user.id });
       return interaction.reply({ ...panel, ephemeral: true });
     }
 
